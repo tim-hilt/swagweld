@@ -6,3 +6,11 @@
 Bundle multiple swagger.yaml files into one big API specification.
 
 Download a binary from [Releases](https://github.com/tim-hilt/swagweld/releases) and run `swagweld --help`.
+
+## Development
+
+Enable the git hooks (fmt + clippy on commit, tests on push):
+
+```sh
+git config core.hooksPath .githooks
+```

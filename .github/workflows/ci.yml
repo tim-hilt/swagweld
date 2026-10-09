@@ -12,9 +12,11 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: llvm-tools-preview
+          components: llvm-tools-preview, rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked
       - run: cargo llvm-cov --locked --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
