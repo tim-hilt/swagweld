@@ -1,3 +1,45 @@
-fn main() {
-    println!("Hello, world!");
+use anyhow::{Context, Result};
+use clap::Parser;
+use std::path::PathBuf;
+use swagweld::{Source, bundle};
+
+#[derive(Parser)]
+struct Cli {
+    /// Where to write the Bundle
+    #[arg(short, long, default_value = "dist/swagger.yaml")]
+    output: PathBuf,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let cwd = std::env::current_dir()?;
+
+    let mut files = Vec::new();
+    for entry in ignore::WalkBuilder::new(&cwd).build() {
+        let path = entry?.into_path();
+        if path.to_string_lossy().ends_with(".swagger.yaml") {
+            files.push(path.strip_prefix(&cwd)?.to_path_buf());
+        }
+    }
+    files.sort();
+    anyhow::ensure!(!files.is_empty(), "no *.swagger.yaml Source Spec found");
+
+    let sources = files
+        .iter()
+        .map(|f| {
+            Ok(Source {
+                file: f.display().to_string(),
+                yaml: std::fs::read_to_string(cwd.join(f))
+                    .with_context(|| format!("reading {}", f.display()))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let title = cwd.file_name().map_or("".into(), |n| n.to_string_lossy());
+    let out = bundle(&sources, &title)?;
+    if let Some(parent) = cli.output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&cli.output, out)?;
+    Ok(())
 }
