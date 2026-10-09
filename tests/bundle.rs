@@ -362,3 +362,53 @@ fn security_schemes_with_different_content_fail_instead_of_renaming() {
         assert!(err.contains(needle), "{err}");
     }
 }
+
+fn op(path: &str, id: &str) -> String {
+    format!("openapi: 3.0.0\npaths:\n  {path}:\n    get:\n      operationId: {id}\n")
+}
+
+#[test]
+fn clashing_operation_ids_are_renamed_in_every_source_and_warn() {
+    let (v, warnings) = weld(&[
+        src("a.swagger.yaml", &op("/items", "getById")),
+        src("users/b.swagger.yaml", &op("/other", "getById")),
+    ]);
+    assert_eq!(v["paths"]["/items"]["get"]["operationId"], serde_norway::Value::from("a_getById"));
+    assert_eq!(v["paths"]["/other"]["get"]["operationId"], serde_norway::Value::from("b_getById"));
+    assert_eq!(warnings.len(), 2);
+    for needle in ["a.swagger.yaml", "users/b.swagger.yaml", "getById", "b_getById"] {
+        assert!(warnings.iter().any(|w| w.contains(needle)), "{needle}: {warnings:?}");
+    }
+}
+
+#[test]
+fn unique_operation_ids_are_untouched() {
+    let (v, warnings) = weld(&[
+        src("a.swagger.yaml", &op("/items", "listA")),
+        src("b.swagger.yaml", &op("/other", "listB")),
+    ]);
+    assert_eq!(v["paths"]["/items"]["get"]["operationId"], serde_norway::Value::from("listA"));
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn links_to_renamed_operation_ids_are_rewritten() {
+    let a = format!(
+        "{}      responses:\n        '200':\n          description: ok\n          links:\n            self:\n              operationId: getById\n",
+        op("/items", "getById")
+    );
+    let (v, _) = weld(&[src("a.swagger.yaml", &a), src("b.swagger.yaml", &op("/other", "getById"))]);
+    let link = &v["paths"]["/items"]["get"]["responses"]["200"]["links"]["self"];
+    assert_eq!(link["operationId"], serde_norway::Value::from("a_getById"));
+}
+
+#[test]
+fn renamed_operation_id_that_still_collides_fails() {
+    let err = bundle(
+        &[src("x/a.swagger.yaml", &op("/items", "getById")), src("y/a.swagger.yaml", &op("/other", "getById"))],
+        &info(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("a_getById"), "{err}");
+}

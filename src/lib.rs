@@ -40,7 +40,8 @@ pub fn bundle_with_warnings(sources: &[Source], info: &Info, root_name: &str) ->
         let (base, origins) = split_servers(&source.file, &spec)?;
         specs.push((spec, base, origins));
     }
-    let warnings = rename_collisions(sources, &mut specs, root_name);
+    let mut warnings = rename_collisions(sources, &mut specs, root_name);
+    warnings.extend(rename_operation_ids(sources, &mut specs, root_name)?);
     let shared = specs.windows(2).all(|w| same_set(&w[0].2, &w[1].2));
     let mut top_servers = Vec::new();
     if shared {
@@ -213,6 +214,86 @@ fn rename_collisions(sources: &[Source], specs: &mut [(Value, String, Vec<Value>
         }
     }
     warnings
+}
+
+/// The operation objects of one spec.
+fn operations(spec: &mut Value) -> impl Iterator<Item = &mut Mapping> {
+    let items = spec.get_mut("paths").and_then(Value::as_mapping_mut).into_iter().flat_map(|p| p.values_mut());
+    items
+        .filter_map(Value::as_mapping_mut)
+        .flat_map(|item| item.iter_mut().filter(|(k, _)| METHODS.contains(&k.as_str().unwrap_or_default())))
+        .filter_map(|(_, op)| op.as_mapping_mut())
+}
+
+/// Rename `operationId`s used by several Source Specs to `<SpecName>_<operationId>`
+/// in each of them, rewriting `links`. Fails if the renamed ids still collide.
+fn rename_operation_ids(sources: &[Source], specs: &mut [(Value, String, Vec<Value>)], root_name: &str) -> Result<Vec<String>> {
+    let mut users: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, (spec, ..)) in specs.iter_mut().enumerate() {
+        for op in operations(spec) {
+            if let Some(id) = op.get("operationId").and_then(Value::as_str) {
+                let list = users.entry(id.to_string()).or_default();
+                if !list.contains(&i) {
+                    list.push(i);
+                }
+            }
+        }
+    }
+    let mut warnings = Vec::new();
+    for (id, group) in users.iter().filter(|(_, g)| g.len() > 1) {
+        let files: Vec<&str> = group.iter().map(|i| sources[*i].file.as_str()).collect();
+        for &i in group {
+            let new = format!("{}_{id}", spec_name(&sources[i].file, root_name));
+            warnings.push(format!(
+                "operationId {id} is used by {}; renamed to {new} in {}",
+                files.join(", "),
+                sources[i].file
+            ));
+            let spec = &mut specs[i].0;
+            for op in operations(spec) {
+                if op.get("operationId").and_then(Value::as_str) == Some(id) {
+                    op.insert("operationId".into(), new.as_str().into());
+                }
+            }
+            rewrite_links(spec, id, &new);
+        }
+    }
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (i, (spec, ..)) in specs.iter_mut().enumerate() {
+        for op in operations(spec) {
+            let Some(id) = op.get("operationId").and_then(Value::as_str) else { continue };
+            match seen.insert(id.to_string(), i) {
+                Some(first) if first != i => anyhow::bail!(
+                    "operationId {id} is used by both {} and {} even after renaming",
+                    sources[first].file,
+                    sources[i].file
+                ),
+                _ => {}
+            }
+        }
+    }
+    Ok(warnings)
+}
+
+fn rewrite_links(node: &mut Value, old: &str, new: &str) {
+    match node {
+        Value::Mapping(map) => {
+            for (key, value) in map.iter_mut() {
+                if key.as_str() == Some("links") {
+                    for link in value.as_mapping_mut().into_iter().flat_map(|l| l.values_mut()) {
+                        if let Some(Value::String(id)) = link.get_mut("operationId") {
+                            if id == old {
+                                *id = new.to_string();
+                            }
+                        }
+                    }
+                }
+                rewrite_links(value, old, new);
+            }
+        }
+        Value::Sequence(items) => items.iter_mut().for_each(|v| rewrite_links(v, old, new)),
+        _ => {}
+    }
 }
 
 /// Apply renames to the component keys and to every local `$ref` of one spec.
