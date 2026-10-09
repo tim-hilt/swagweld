@@ -412,3 +412,37 @@ fn renamed_operation_id_that_still_collides_fails() {
     .to_string();
     assert!(err.contains("a_getById"), "{err}");
 }
+
+#[test]
+fn colliding_path_items_are_renamed_and_their_refs_rewritten() {
+    let a = "openapi: 3.1.0\npaths:\n  /items:\n    $ref: '#/components/pathItems/Shared'\ncomponents:\n  pathItems:\n    Shared:\n      get: {}\n";
+    let b = "openapi: 3.1.0\npaths:\n  /other:\n    get: {}\ncomponents:\n  pathItems:\n    Shared:\n      post: {}\n";
+    let (v, warnings) = weld(&[src("a.swagger.yaml", a), src("b.swagger.yaml", b)]);
+    let items = &v["components"]["pathItems"];
+    assert!(items["a_Shared"].get("get").is_some());
+    assert!(items["b_Shared"].get("post").is_some());
+    assert_eq!(v["paths"]["/items"]["$ref"], serde_norway::Value::from("#/components/pathItems/a_Shared"));
+    assert_eq!(warnings.len(), 2);
+}
+
+fn webhook(file: &str, body: &str) -> Source {
+    src(file, &format!("openapi: 3.1.0\nservers:\n  - url: /base\npaths:\n  /{file}:\n    get: {{}}\nwebhooks:\n  ping:\n    post:\n      description: {body}\n"))
+}
+
+#[test]
+fn identical_webhooks_are_deduped_without_base_path() {
+    let (v, warnings) = weld(&[webhook("a.swagger.yaml", "x"), webhook("b.swagger.yaml", "x")]);
+    assert_eq!(v["webhooks"].as_mapping().unwrap().len(), 1);
+    assert!(v["webhooks"]["ping"].get("post").is_some());
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn differing_webhooks_are_renamed_with_spec_name_and_warn() {
+    let (v, warnings) = weld(&[webhook("a.swagger.yaml", "x"), webhook("b.swagger.yaml", "y")]);
+    assert!(v["webhooks"].get("ping").is_none());
+    assert!(v["webhooks"].get("a_ping").is_some());
+    assert!(v["webhooks"].get("b_ping").is_some());
+    assert_eq!(warnings.len(), 2);
+    assert!(warnings.iter().all(|w| w.contains("webhooks.ping")));
+}

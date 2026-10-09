@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use serde_norway::{Mapping, Value};
 use std::collections::{BTreeMap, HashMap};
 
-const SECTIONS: [&str; 8] =
-    ["schemas", "parameters", "responses", "requestBodies", "headers", "examples", "links", "callbacks"];
+const SECTIONS: [&str; 9] =
+    ["schemas", "parameters", "responses", "requestBodies", "headers", "examples", "links", "callbacks", "pathItems"];
 const METHODS: [&str; 8] = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
 
 /// A discovered Source Spec: its relative path and raw YAML text.
@@ -29,6 +29,7 @@ pub fn bundle_with_warnings(sources: &[Source], info: &Info, root_name: &str) ->
     let mut paths = Mapping::new();
     let mut tags: Vec<(Value, String)> = Vec::new();
     let mut components = Mapping::new();
+    let mut webhooks = Mapping::new();
     let mut owners: HashMap<(String, String), String> = HashMap::new();
     let mut component_owners: HashMap<(String, String), String> = HashMap::new();
     let mut templates: HashMap<String, (String, String)> = HashMap::new();
@@ -41,6 +42,7 @@ pub fn bundle_with_warnings(sources: &[Source], info: &Info, root_name: &str) ->
         specs.push((spec, base, origins));
     }
     let mut warnings = rename_collisions(sources, &mut specs, root_name);
+    warnings.extend(rename_webhooks(sources, &mut specs, root_name));
     warnings.extend(rename_operation_ids(sources, &mut specs, root_name)?);
     let shared = specs.windows(2).all(|w| same_set(&w[0].2, &w[1].2));
     let mut top_servers = Vec::new();
@@ -59,6 +61,14 @@ pub fn bundle_with_warnings(sources: &[Source], info: &Info, root_name: &str) ->
                     ),
                     None => tags.push((tag.clone(), source.file.clone())),
                 }
+            }
+        }
+        if let Some(Value::Mapping(spec_webhooks)) = spec.get("webhooks") {
+            for (name, value) in spec_webhooks {
+                if webhooks.get(name).is_some_and(|existing| existing != value) {
+                    anyhow::bail!("webhooks.{} is defined differently by several Source Specs (last: {})", name.as_str().unwrap_or_default(), source.file);
+                }
+                webhooks.insert(name.clone(), value.clone());
             }
         }
         if let Some(Value::Mapping(sections)) = spec.get("components") {
@@ -156,6 +166,9 @@ pub fn bundle_with_warnings(sources: &[Source], info: &Info, root_name: &str) ->
         root.insert("tags".into(), Value::Sequence(tags.into_iter().map(|(t, _)| t).collect()));
     }
     root.insert("paths".into(), Value::Mapping(paths));
+    if !webhooks.is_empty() {
+        root.insert("webhooks".into(), Value::Mapping(webhooks));
+    }
     if !components.is_empty() {
         root.insert("components".into(), Value::Mapping(components));
     }
@@ -211,6 +224,35 @@ fn rename_collisions(sources: &[Source], specs: &mut [(Value, String, Vec<Value>
     for ((spec, ..), renames) in specs.iter_mut().zip(&renames) {
         if !renames.is_empty() {
             rewrite(spec, renames);
+        }
+    }
+    warnings
+}
+
+/// Rename webhooks that share a name but differ in content to `<SpecName>_<name>`
+/// in every Source Spec defining them. Returns one warning per rename.
+fn rename_webhooks(sources: &[Source], specs: &mut [(Value, String, Vec<Value>)], root_name: &str) -> Vec<String> {
+    let mut groups: BTreeMap<String, Vec<(usize, Value)>> = BTreeMap::new();
+    for (i, (spec, ..)) in specs.iter().enumerate() {
+        for (name, value) in spec.get("webhooks").and_then(Value::as_mapping).into_iter().flatten() {
+            groups.entry(name.as_str().unwrap_or_default().to_string()).or_default().push((i, value.clone()));
+        }
+    }
+    let mut warnings = Vec::new();
+    for (name, group) in groups.iter().filter(|(_, g)| g.iter().any(|(_, v)| *v != g[0].1)) {
+        let files: Vec<&str> = group.iter().map(|(i, _)| sources[*i].file.as_str()).collect();
+        for (i, _) in group {
+            let new = format!("{}_{name}", spec_name(&sources[*i].file, root_name));
+            warnings.push(format!(
+                "webhooks.{name} differs between {}; renamed to {new} in {}",
+                files.join(", "),
+                sources[*i].file
+            ));
+            if let Some(hooks) = specs[*i].0.get_mut("webhooks").and_then(Value::as_mapping_mut) {
+                if let Some(value) = hooks.remove(name.as_str()) {
+                    hooks.insert(new.as_str().into(), value);
+                }
+            }
         }
     }
     warnings
