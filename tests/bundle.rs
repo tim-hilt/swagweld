@@ -1,4 +1,10 @@
-use swagweld::{Info, Source, bundle, bundle_with_warnings};
+use swagweld::{Info, Source, is_source_spec};
+
+const ROOT: &str = "root";
+
+fn bundle(sources: &[Source], info: &Info) -> anyhow::Result<String> {
+    swagweld::bundle(sources, info, ROOT).map(|b| b.yaml)
+}
 
 fn src(file: &str, yaml: &str) -> Source {
     Source {
@@ -434,8 +440,8 @@ fn same_path_with_different_servers_fails_naming_files_and_path() {
 const PATHS: &str = "paths:\n  /items:\n    get: {}\n";
 
 fn weld(sources: &[Source]) -> (serde_norway::Value, Vec<String>) {
-    let (yaml, warnings) = bundle_with_warnings(sources, &info(), "root").unwrap();
-    (parse(&yaml), warnings)
+    let b = swagweld::bundle(sources, &info(), ROOT).unwrap();
+    (parse(&b.yaml), b.warnings)
 }
 
 #[test]
@@ -776,4 +782,31 @@ fn shared_json_schema_dialect_is_kept() {
         v["jsonSchemaDialect"],
         serde_norway::Value::from("https://one")
     );
+}
+
+#[test]
+fn root_level_spec_is_named_after_the_root_directory() {
+    let a =
+        format!("openapi: 3.0.0\n{PATHS}components:\n  schemas:\n    User:\n      type: string\n");
+    let b = a.replace("/items", "/other").replace("string", "integer");
+    let (v, _) = weld(&[src("b.swagger.yaml", &b), src("swagger.yaml", &a)]);
+    assert!(
+        v["components"]["schemas"].get("root_User").is_some(),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn source_spec_file_names() {
+    for name in [
+        "swagger.yaml",
+        "swagger.yml",
+        "u.swagger.yaml",
+        "v.swagger.yml",
+    ] {
+        assert!(is_source_spec(name), "{name}");
+    }
+    for name in ["openapi.yaml", "myswagger.yaml", "swagger.json"] {
+        assert!(!is_source_spec(name), "{name}");
+    }
 }

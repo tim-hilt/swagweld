@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
-use swagweld::{Info, Source, bundle_with_warnings};
+use swagweld::{Info, Source, bundle, is_source_spec};
 
 #[derive(Parser)]
 #[command(version)]
@@ -31,13 +31,9 @@ fn main() -> Result<()> {
     let output = cwd.join(&cli.output);
     for entry in ignore::WalkBuilder::new(&cwd).require_git(false).build() {
         let path = entry?.into_path();
-        let name = path
+        let is_spec = path
             .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default();
-        let is_spec = ["swagger.yaml", "swagger.yml"]
-            .iter()
-            .any(|s| name == *s || name.ends_with(&format!(".{s}")));
+            .is_some_and(|n| is_source_spec(&n.to_string_lossy()));
         if path.is_file() && is_spec && path != output {
             files.push(path.strip_prefix(&cwd)?.to_path_buf());
         }
@@ -66,15 +62,15 @@ fn main() -> Result<()> {
         description: cli.description,
     };
     let root_name = cwd.file_name().map_or("".into(), |n| n.to_string_lossy());
-    let (out, warnings) = bundle_with_warnings(&sources, &info, &root_name)?;
+    let bundle = bundle(&sources, &info, &root_name)?;
     if !cli.quiet {
-        for warning in warnings {
+        for warning in bundle.warnings {
             eprintln!("warning: {warning}");
         }
     }
     if let Some(parent) = cli.output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&cli.output, out)?;
+    std::fs::write(&cli.output, bundle.yaml)?;
     Ok(())
 }

@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde_norway::{Mapping, Value};
 use std::collections::{BTreeMap, HashMap};
 
+/// Component sections whose entries are referenced by `$ref`, so Collisions can be renamed.
+/// Other sections (e.g. `securitySchemes`, referenced by name from `security`) fail instead.
 const SECTIONS: [&str; 9] = [
     "schemas",
     "parameters",
@@ -16,6 +18,8 @@ const SECTIONS: [&str; 9] = [
 const METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
 ];
+/// Source Spec file names: exactly one of these, or `<name>.` followed by one.
+const SPEC_FILE_NAMES: [&str; 2] = ["swagger.yaml", "swagger.yml"];
 
 /// A discovered Source Spec: its relative path and raw YAML text.
 pub struct Source {
@@ -30,181 +34,39 @@ pub struct Info {
     pub description: Option<String>,
 }
 
-/// Weld Source Specs (already in sorted order) into Bundle YAML.
-pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
-    Ok(bundle_with_warnings(sources, info, "")?.0)
+/// A welded Bundle and the warnings about Collisions resolved by renaming.
+pub struct Bundle {
+    pub yaml: String,
+    pub warnings: Vec<String>,
 }
 
-/// Like [`bundle`], also returning warnings. `root_name` is the Spec Name of root-level `swagger.yaml`.
-pub fn bundle_with_warnings(
-    sources: &[Source],
-    info: &Info,
-    root_name: &str,
-) -> Result<(String, Vec<String>)> {
-    let mut paths = Mapping::new();
-    let mut tags: Vec<(Value, String)> = Vec::new();
-    let mut components = Mapping::new();
-    let mut webhooks = Mapping::new();
-    let mut owners: HashMap<(String, String), String> = HashMap::new();
-    let mut component_owners: HashMap<(String, String), String> = HashMap::new();
-    let mut templates: HashMap<String, (String, String)> = HashMap::new();
-    let mut specs = Vec::new();
-    for source in sources {
-        let spec: Value = serde_norway::from_str(&source.yaml)
-            .with_context(|| format!("{}: invalid YAML", source.file))?;
-        validate(source, &spec)?;
-        let (base, origins) = split_servers(&source.file, &spec)?;
-        specs.push((spec, base, origins));
-    }
-    let openapi = specs
+/// Whether a file name marks a Source Spec.
+pub fn is_source_spec(file_name: &str) -> bool {
+    SPEC_FILE_NAMES
         .iter()
-        .filter_map(|(spec, ..)| spec["openapi"].as_str())
-        .max_by_key(|v| version_key(v))
-        .unwrap_or("3.0.0")
-        .to_string();
+        .any(|s| file_name == *s || file_name.ends_with(&format!(".{s}")))
+}
+
+/// Weld Source Specs (already in sorted order) into a Bundle. Source paths are relative to a
+/// root directory named `root_name`, which is the Spec Name of a root-level `swagger.yaml`.
+pub fn bundle(sources: &[Source], info: &Info, root_name: &str) -> Result<Bundle> {
+    let mut specs = sources
+        .iter()
+        .map(|source| Spec::parse(source, root_name))
+        .collect::<Result<Vec<_>>>()?;
     // Upgrade before Collision detection, so equivalent 3.0 and 3.1 schemas dedupe.
-    if !openapi.starts_with("3.0") {
-        for (spec, ..) in specs
-            .iter_mut()
-            .filter(|(s, ..)| s["openapi"].as_str().is_some_and(|v| v.starts_with("3.0")))
-        {
-            upgrade_schemas(spec);
-        }
-    }
-    let mut dialect: Option<(&Value, &str)> = None;
-    for (source, (spec, ..)) in sources.iter().zip(&specs) {
-        match (spec.get("jsonSchemaDialect"), dialect) {
-            (Some(d), Some((first, file))) if d != first => anyhow::bail!(
-                "jsonSchemaDialect differs between {file} and {}",
-                source.file
-            ),
-            (Some(d), None) => dialect = Some((d, &source.file)),
-            _ => {}
-        }
-    }
-    let dialect = dialect.map(|(d, _)| d.clone());
-    let mut warnings = rename_collisions(sources, &mut specs, root_name);
-    warnings.extend(rename_webhooks(sources, &mut specs, root_name));
-    warnings.extend(rename_operation_ids(sources, &mut specs, root_name)?);
-    let shared = specs.windows(2).all(|w| same_set(&w[0].2, &w[1].2));
-    let mut top_servers = Vec::new();
-    if shared {
-        top_servers = specs.first().map(|s| s.2.clone()).unwrap_or_default();
-    }
-    for (source, (spec, base, origins)) in sources.iter().zip(&specs) {
-        if let Some(Value::Sequence(spec_tags)) = spec.get("tags") {
-            for tag in spec_tags {
-                match tags.iter().find(|(t, _)| t.get("name") == tag.get("name")) {
-                    Some((existing, _)) if existing == tag => {}
-                    Some((_, first)) => anyhow::bail!(
-                        "tag {} is defined differently in {first} and {}",
-                        tag.get("name").and_then(Value::as_str).unwrap_or_default(),
-                        source.file
-                    ),
-                    None => tags.push((tag.clone(), source.file.clone())),
-                }
-            }
-        }
-        if let Some(Value::Mapping(spec_webhooks)) = spec.get("webhooks") {
-            for (name, value) in spec_webhooks {
-                if webhooks.get(name).is_some_and(|existing| existing != value) {
-                    anyhow::bail!(
-                        "webhooks.{} is defined differently by several Source Specs (last: {})",
-                        name.as_str().unwrap_or_default(),
-                        source.file
-                    );
-                }
-                webhooks.insert(name.clone(), value.clone());
-            }
-        }
-        if let Some(Value::Mapping(sections)) = spec.get("components") {
-            for (section, entries) in sections {
-                let (Some(entries), Value::Mapping(into)) = (
-                    entries.as_mapping(),
-                    components
-                        .entry(section.clone())
-                        .or_insert_with(|| Mapping::new().into()),
-                ) else {
-                    continue;
-                };
-                for (name, value) in entries {
-                    let key = (
-                        section.as_str().unwrap_or_default().to_string(),
-                        name.as_str().unwrap_or_default().to_string(),
-                    );
-                    if let Some(existing) = into.get(name) {
-                        if existing != value {
-                            anyhow::bail!(
-                                "components.{}.{} is defined differently in {} and {}",
-                                key.0,
-                                key.1,
-                                component_owners[&key],
-                                source.file
-                            );
-                        }
-                        continue;
-                    }
-                    component_owners.insert(key, source.file.clone());
-                    into.insert(name.clone(), value.clone());
-                }
-            }
-        }
-        if let Some(Value::Mapping(spec_paths)) = spec.get("paths") {
-            for (path, item) in spec_paths {
-                let path = path.as_str().unwrap_or_default();
-                let path = join_paths(base, path);
-                let Value::Mapping(item) = item else { continue };
-                let mut item = item.clone();
-                if !shared && !origins.is_empty() {
-                    item.insert("servers".into(), Value::Sequence(origins.clone()));
-                }
-                let (first_path, first) = templates
-                    .entry(template_shape(&path))
-                    .or_insert_with(|| (path.clone(), source.file.clone()));
-                if *first_path != path {
-                    anyhow::bail!(
-                        "{first_path} in {first} and {path} in {} differ only in template names",
-                        source.file
-                    );
-                }
-                let merged = paths
-                    .entry(path.clone().into())
-                    .or_insert_with(|| Mapping::new().into());
-                let merged = merged.as_mapping_mut().unwrap();
-                for (key, value) in &item {
-                    if merged.contains_key(key) {
-                        if let Some(method) = key.as_str().filter(|k| METHODS.contains(k)) {
-                            let first = &owners[&(path.clone(), method.to_string())];
-                            anyhow::bail!(
-                                "{path} {method} is defined in both {first} and {}",
-                                source.file
-                            );
-                        }
-                        if merged[key] != *value {
-                            let field = key.as_str().unwrap_or_default();
-                            let first = &owners[&(path.clone(), field.to_string())];
-                            anyhow::bail!(
-                                "{path} {field} is defined differently in {first} and {}",
-                                source.file
-                            );
-                        }
-                        continue;
-                    }
-                    if let Some(field) = key.as_str() {
-                        owners.insert((path.clone(), field.to_string()), source.file.clone());
-                    }
-                    let mut value = value.clone();
-                    if let (Some(security), Value::Mapping(op)) = (spec.get("security"), &mut value)
-                        && METHODS.contains(&key.as_str().unwrap_or_default())
-                    {
-                        op.entry("security".into())
-                            .or_insert_with(|| security.clone());
-                    }
-                    merged.insert(key.clone(), value);
-                }
-            }
-        }
-    }
+    let openapi = unify_versions(&mut specs);
+    let dialect = shared_dialect(&specs)?;
+    let mut warnings = rename_components(&mut specs);
+    warnings.extend(rename_webhooks(&mut specs));
+    warnings.extend(rename_operation_ids(&mut specs)?);
+    let shared = specs
+        .windows(2)
+        .all(|w| same_set(&w[0].origins, &w[1].origins));
+    let tags = merge_tags(&specs)?;
+    let paths = merge_paths(&specs, shared)?;
+    let webhooks = merge_webhooks(&specs)?;
+    let components = merge_components(&specs)?;
 
     let mut info_map = Mapping::new();
     info_map.insert("title".into(), info.title.as_str().into());
@@ -219,14 +81,11 @@ pub fn bundle_with_warnings(
     if let Some(dialect) = dialect {
         root.insert("jsonSchemaDialect".into(), dialect);
     }
-    if !top_servers.is_empty() {
-        root.insert("servers".into(), Value::Sequence(top_servers));
+    if let Some(spec) = specs.first().filter(|s| shared && !s.origins.is_empty()) {
+        root.insert("servers".into(), Value::Sequence(spec.origins.clone()));
     }
     if !tags.is_empty() {
-        root.insert(
-            "tags".into(),
-            Value::Sequence(tags.into_iter().map(|(t, _)| t).collect()),
-        );
+        root.insert("tags".into(), Value::Sequence(tags));
     }
     root.insert("paths".into(), Value::Mapping(paths));
     if !webhooks.is_empty() {
@@ -235,7 +94,36 @@ pub fn bundle_with_warnings(
     if !components.is_empty() {
         root.insert("components".into(), Value::Mapping(components));
     }
-    Ok((serde_norway::to_string(&Value::Mapping(root))?, warnings))
+    let yaml = serde_norway::to_string(&Value::Mapping(root))?;
+    Ok(Bundle { yaml, warnings })
+}
+
+/// One parsed and validated Source Spec.
+struct Spec<'a> {
+    file: &'a str,
+    /// The Spec Name, prefixing this spec's renamed Collisions.
+    name: String,
+    doc: Value,
+    /// Path part shared by all `servers`, prepended to every path.
+    base_path: String,
+    /// Host parts of the absolute `servers`.
+    origins: Vec<Value>,
+}
+
+impl<'a> Spec<'a> {
+    fn parse(source: &'a Source, root_name: &str) -> Result<Self> {
+        let doc: Value = serde_norway::from_str(&source.yaml)
+            .with_context(|| format!("{}: invalid YAML", source.file))?;
+        validate(source, &doc)?;
+        let (base_path, origins) = split_servers(&source.file, &doc)?;
+        Ok(Spec {
+            file: &source.file,
+            name: spec_name(&source.file, root_name),
+            doc,
+            base_path,
+            origins,
+        })
+    }
 }
 
 /// The Spec Name: filename prefix of `<name>.swagger.yaml`, else the parent directory's name.
@@ -245,8 +133,8 @@ fn spec_name(file: &str, root_name: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
-    for suffix in [".swagger.yaml", ".swagger.yml"] {
-        if let Some(prefix) = name.strip_suffix(suffix) {
+    for suffix in SPEC_FILE_NAMES {
+        if let Some(prefix) = name.strip_suffix(&format!(".{suffix}")) {
             return prefix.to_string();
         }
     }
@@ -256,104 +144,130 @@ fn spec_name(file: &str, root_name: &str) -> String {
     }
 }
 
-/// Rename components that share a name but differ in content to `<SpecName>_<Name>`
-/// in every Source Spec defining them, rewriting local `$ref`s. Returns one warning per rename.
-fn rename_collisions(
-    sources: &[Source],
-    specs: &mut [(Value, String, Vec<Value>)],
-    root_name: &str,
+/// The highest `openapi` version of all specs. If it is above 3.0, 3.0 specs are upgraded to it.
+fn unify_versions(specs: &mut [Spec]) -> String {
+    let openapi = specs
+        .iter()
+        .filter_map(|s| s.doc["openapi"].as_str())
+        .max_by_key(|v| version_key(v))
+        .unwrap_or("3.0.0")
+        .to_string();
+    if !openapi.starts_with("3.0") {
+        for spec in specs.iter_mut().filter(|s| {
+            s.doc["openapi"]
+                .as_str()
+                .is_some_and(|v| v.starts_with("3.0"))
+        }) {
+            upgrade_schemas(&mut spec.doc);
+        }
+    }
+    openapi
+}
+
+/// The `jsonSchemaDialect` all specs declaring one agree on.
+fn shared_dialect(specs: &[Spec]) -> Result<Option<Value>> {
+    let mut dialect: Option<(&Value, &str)> = None;
+    for spec in specs {
+        match (spec.doc.get("jsonSchemaDialect"), dialect) {
+            (Some(d), Some((first, file))) if d != first => {
+                anyhow::bail!("jsonSchemaDialect differs between {file} and {}", spec.file)
+            }
+            (Some(d), None) => dialect = Some((d, spec.file)),
+            _ => {}
+        }
+    }
+    Ok(dialect.map(|(d, _)| d.clone()))
+}
+
+/// Resolve one Collision: rename `name` to `<SpecName>_<name>` in each spec of `users`,
+/// via `apply(doc, new_name)`. `label` names the colliding thing in the warnings.
+/// Returns one warning per rename.
+fn rename(
+    specs: &mut [Spec],
+    label: &str,
+    name: &str,
+    users: &[usize],
+    apply: impl Fn(&mut Value, &str),
 ) -> Vec<String> {
-    let mut groups: BTreeMap<(&str, String), Vec<(usize, Value)>> = BTreeMap::new();
-    for (i, (spec, ..)) in specs.iter().enumerate() {
+    let files: Vec<&str> = users.iter().map(|&i| specs[i].file).collect();
+    let files = files.join(", ");
+    users
+        .iter()
+        .map(|&i| {
+            let spec = &mut specs[i];
+            let new = format!("{}_{name}", spec.name);
+            apply(&mut spec.doc, &new);
+            format!(
+                "{label} collides between {files}; renamed to {new} in {}",
+                spec.file
+            )
+        })
+        .collect()
+}
+
+/// The spec indexes of every name whose values differ between specs.
+fn differing<K>(groups: BTreeMap<K, Vec<(usize, &Value)>>) -> Vec<(K, Vec<usize>)> {
+    groups
+        .into_iter()
+        .filter(|(_, g)| g.iter().any(|(_, v)| *v != g[0].1))
+        .map(|(k, g)| (k, g.into_iter().map(|(i, _)| i).collect()))
+        .collect()
+}
+
+/// Rename the key `old` of a mapping to `new`, if present.
+fn rename_key(map: Option<&mut Value>, old: &str, new: &str) {
+    if let Some(map) = map.and_then(Value::as_mapping_mut)
+        && let Some(value) = map.remove(old)
+    {
+        map.insert(new.into(), value);
+    }
+}
+
+/// Rename differing components of the same name, rewriting local `$ref`s to them.
+fn rename_components(specs: &mut [Spec]) -> Vec<String> {
+    let mut groups: BTreeMap<(&str, String), Vec<(usize, &Value)>> = BTreeMap::new();
+    for (i, spec) in specs.iter().enumerate() {
         for section in SECTIONS {
-            let entries = spec
-                .get("components")
-                .and_then(|c| c.get(section))
-                .and_then(Value::as_mapping);
-            for (name, value) in entries.into_iter().flatten() {
+            let entries = spec.doc.get("components").and_then(|c| c.get(section));
+            for (name, value) in entries.and_then(Value::as_mapping).into_iter().flatten() {
                 if let Some(name) = name.as_str() {
                     groups
                         .entry((section, name.to_string()))
                         .or_default()
-                        .push((i, value.clone()));
+                        .push((i, value));
                 }
             }
         }
     }
-    let mut renames: Vec<HashMap<(&str, String), String>> = vec![HashMap::new(); specs.len()];
     let mut warnings = Vec::new();
-    for ((section, name), group) in &groups {
-        if group.iter().all(|(_, v)| *v == group[0].1) {
-            continue;
-        }
-        let files: Vec<&str> = group
-            .iter()
-            .map(|(i, _)| sources[*i].file.as_str())
-            .collect();
-        for (i, _) in group {
-            let new = format!("{}_{name}", spec_name(&sources[*i].file, root_name));
-            warnings.push(format!(
-                "components.{section}.{name} differs between {}; renamed to {new} in {}",
-                files.join(", "),
-                sources[*i].file
-            ));
-            renames[*i].insert((section, name.clone()), new);
-        }
-    }
-    for ((spec, ..), renames) in specs.iter_mut().zip(&renames) {
-        if !renames.is_empty() {
-            rewrite(spec, renames);
-        }
+    for ((section, name), users) in differing(groups) {
+        let label = format!("components.{section}.{name}");
+        warnings.extend(rename(specs, &label, &name, &users, |doc, new| {
+            let section_map = doc.get_mut("components").and_then(|c| c.get_mut(section));
+            rename_key(section_map, &name, new);
+            let prefix = format!("#/components/{section}/");
+            rewrite_refs(doc, &format!("{prefix}{name}"), &format!("{prefix}{new}"));
+        }));
     }
     warnings
 }
 
-/// Rename webhooks that share a name but differ in content to `<SpecName>_<name>`
-/// in every Source Spec defining them. Returns one warning per rename.
-fn rename_webhooks(
-    sources: &[Source],
-    specs: &mut [(Value, String, Vec<Value>)],
-    root_name: &str,
-) -> Vec<String> {
-    let mut groups: BTreeMap<String, Vec<(usize, Value)>> = BTreeMap::new();
-    for (i, (spec, ..)) in specs.iter().enumerate() {
-        for (name, value) in spec
-            .get("webhooks")
-            .and_then(Value::as_mapping)
-            .into_iter()
-            .flatten()
-        {
-            groups
-                .entry(name.as_str().unwrap_or_default().to_string())
-                .or_default()
-                .push((i, value.clone()));
+/// Rename differing webhooks of the same name.
+fn rename_webhooks(specs: &mut [Spec]) -> Vec<String> {
+    let mut groups: BTreeMap<String, Vec<(usize, &Value)>> = BTreeMap::new();
+    for (i, spec) in specs.iter().enumerate() {
+        let hooks = spec.doc.get("webhooks").and_then(Value::as_mapping);
+        for (name, value) in hooks.into_iter().flatten() {
+            let name = name.as_str().unwrap_or_default().to_string();
+            groups.entry(name).or_default().push((i, value));
         }
     }
     let mut warnings = Vec::new();
-    for (name, group) in groups
-        .iter()
-        .filter(|(_, g)| g.iter().any(|(_, v)| *v != g[0].1))
-    {
-        let files: Vec<&str> = group
-            .iter()
-            .map(|(i, _)| sources[*i].file.as_str())
-            .collect();
-        for (i, _) in group {
-            let new = format!("{}_{name}", spec_name(&sources[*i].file, root_name));
-            warnings.push(format!(
-                "webhooks.{name} differs between {}; renamed to {new} in {}",
-                files.join(", "),
-                sources[*i].file
-            ));
-            if let Some(hooks) = specs[*i]
-                .0
-                .get_mut("webhooks")
-                .and_then(Value::as_mapping_mut)
-                && let Some(value) = hooks.remove(name.as_str())
-            {
-                hooks.insert(new.as_str().into(), value);
-            }
-        }
+    for (name, users) in differing(groups) {
+        let label = format!("webhooks.{name}");
+        warnings.extend(rename(specs, &label, &name, &users, |doc, new| {
+            rename_key(doc.get_mut("webhooks"), &name, new)
+        }));
     }
     warnings
 }
@@ -374,16 +288,12 @@ fn operations(spec: &mut Value) -> impl Iterator<Item = &mut Mapping> {
         .filter_map(|(_, op)| op.as_mapping_mut())
 }
 
-/// Rename `operationId`s used by several Source Specs to `<SpecName>_<operationId>`
-/// in each of them, rewriting `links`. Fails if the renamed ids still collide.
-fn rename_operation_ids(
-    sources: &[Source],
-    specs: &mut [(Value, String, Vec<Value>)],
-    root_name: &str,
-) -> Result<Vec<String>> {
+/// Rename `operationId`s used by several specs, rewriting `links` to them.
+/// Fails if the renamed ids still collide.
+fn rename_operation_ids(specs: &mut [Spec]) -> Result<Vec<String>> {
     let mut users: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (i, (spec, ..)) in specs.iter_mut().enumerate() {
-        for op in operations(spec) {
+    for (i, spec) in specs.iter_mut().enumerate() {
+        for op in operations(&mut spec.doc) {
             if let Some(id) = op.get("operationId").and_then(Value::as_str) {
                 let list = users.entry(id.to_string()).or_default();
                 if !list.contains(&i) {
@@ -393,35 +303,27 @@ fn rename_operation_ids(
         }
     }
     let mut warnings = Vec::new();
-    for (id, group) in users.iter().filter(|(_, g)| g.len() > 1) {
-        let files: Vec<&str> = group.iter().map(|i| sources[*i].file.as_str()).collect();
-        for &i in group {
-            let new = format!("{}_{id}", spec_name(&sources[i].file, root_name));
-            warnings.push(format!(
-                "operationId {id} is used by {}; renamed to {new} in {}",
-                files.join(", "),
-                sources[i].file
-            ));
-            let spec = &mut specs[i].0;
-            for op in operations(spec) {
+    for (id, users) in users.iter().filter(|(_, u)| u.len() > 1) {
+        let label = format!("operationId {id}");
+        warnings.extend(rename(specs, &label, id, users, |doc, new| {
+            for op in operations(doc) {
                 if op.get("operationId").and_then(Value::as_str) == Some(id) {
-                    op.insert("operationId".into(), new.as_str().into());
+                    op.insert("operationId".into(), new.into());
                 }
             }
-            rewrite_links(spec, id, &new);
-        }
+            rewrite_links(doc, id, new);
+        }));
     }
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    for (i, (spec, ..)) in specs.iter_mut().enumerate() {
-        for op in operations(spec) {
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for spec in specs.iter_mut() {
+        for op in operations(&mut spec.doc) {
             let Some(id) = op.get("operationId").and_then(Value::as_str) else {
                 continue;
             };
-            match seen.insert(id.to_string(), i) {
-                Some(first) if first != i => anyhow::bail!(
-                    "operationId {id} is used by both {} and {} even after renaming",
-                    sources[first].file,
-                    sources[i].file
+            match seen.insert(id.to_string(), spec.file) {
+                Some(first) if first != spec.file => anyhow::bail!(
+                    "operationId {id} is used by both {first} and {} even after renaming",
+                    spec.file
                 ),
                 _ => {}
             }
@@ -455,49 +357,169 @@ fn rewrite_links(node: &mut Value, old: &str, new: &str) {
     }
 }
 
-/// Apply renames to the component keys and to every local `$ref` of one spec.
-fn rewrite(spec: &mut Value, renames: &HashMap<(&str, String), String>) {
-    for ((section, old), new) in renames {
-        let entries = spec
-            .get_mut("components")
-            .and_then(|c| c.get_mut(*section))
-            .and_then(Value::as_mapping_mut);
-        if let Some(value) = entries.and_then(|e| e.remove(old.as_str()).map(|v| (e, v))) {
-            value.0.insert(new.as_str().into(), value.1);
-        }
-    }
-    rewrite_refs(spec, renames);
-}
-
-fn rewrite_refs(node: &mut Value, renames: &HashMap<(&str, String), String>) {
+/// Point every `$ref` to `old` (or into it, `old/...`) at `new` instead.
+fn rewrite_refs(node: &mut Value, old: &str, new: &str) {
     match node {
         Value::Mapping(map) => {
             for (key, value) in map.iter_mut() {
                 match (key.as_str(), &mut *value) {
                     (Some("$ref"), Value::String(r)) => {
-                        let target = r
-                            .strip_prefix("#/components/")
-                            .and_then(|t| t.split_once('/'));
-                        if let Some((section, rest)) = target {
-                            let (name, tail) = rest
-                                .split_once('/')
-                                .map_or((rest, String::new()), |(n, t)| (n, format!("/{t}")));
-                            if let Some(new) = renames
-                                .iter()
-                                .find(|((s, n), _)| *s == section && n == name)
-                                .map(|(_, new)| new)
-                            {
-                                *r = format!("#/components/{section}/{new}{tail}");
-                            }
+                        if let Some(tail) = r.strip_prefix(old)
+                            && (tail.is_empty() || tail.starts_with('/'))
+                        {
+                            *r = format!("{new}{tail}");
                         }
                     }
-                    _ => rewrite_refs(value, renames),
+                    _ => rewrite_refs(value, old, new),
                 }
             }
         }
-        Value::Sequence(items) => items.iter_mut().for_each(|v| rewrite_refs(v, renames)),
+        Value::Sequence(items) => items.iter_mut().for_each(|v| rewrite_refs(v, old, new)),
         _ => {}
     }
+}
+
+/// Insert `entries` into `into`, deduping identical ones. Fails on a name already present with
+/// different content (a Collision left after renaming). `label` prefixes names in errors;
+/// `owners` remembers which file contributed each labelled name first.
+fn merge_entries<'a>(
+    into: &mut Mapping,
+    label: &str,
+    entries: &Mapping,
+    file: &'a str,
+    owners: &mut HashMap<String, &'a str>,
+) -> Result<()> {
+    for (name, value) in entries {
+        let key = format!("{label}.{}", name.as_str().unwrap_or_default());
+        match into.get(name) {
+            Some(existing) if existing != value => anyhow::bail!(
+                "{key} is defined differently in {} and {file}",
+                owners[&key]
+            ),
+            Some(_) => {}
+            None => {
+                owners.insert(key, file);
+                into.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_components(specs: &[Spec]) -> Result<Mapping> {
+    let mut components = Mapping::new();
+    let mut owners = HashMap::new();
+    for spec in specs {
+        let sections = spec.doc.get("components").and_then(Value::as_mapping);
+        for (section, entries) in sections.into_iter().flatten() {
+            let (Some(section), Some(entries)) = (section.as_str(), entries.as_mapping()) else {
+                continue;
+            };
+            let into = components
+                .entry(section.into())
+                .or_insert_with(|| Mapping::new().into());
+            let label = format!("components.{section}");
+            let into = into.as_mapping_mut().unwrap();
+            merge_entries(into, &label, entries, spec.file, &mut owners)?;
+        }
+    }
+    Ok(components)
+}
+
+fn merge_webhooks(specs: &[Spec]) -> Result<Mapping> {
+    let mut webhooks = Mapping::new();
+    let mut owners = HashMap::new();
+    for spec in specs {
+        if let Some(entries) = spec.doc.get("webhooks").and_then(Value::as_mapping) {
+            merge_entries(&mut webhooks, "webhooks", entries, spec.file, &mut owners)?;
+        }
+    }
+    Ok(webhooks)
+}
+
+/// All tags in first-seen order. Fails on a tag name defined differently.
+fn merge_tags(specs: &[Spec]) -> Result<Vec<Value>> {
+    let mut tags: Vec<(&Value, &str)> = Vec::new();
+    for spec in specs {
+        let spec_tags = spec.doc.get("tags").and_then(Value::as_sequence);
+        for tag in spec_tags.into_iter().flatten() {
+            match tags.iter().find(|(t, _)| t.get("name") == tag.get("name")) {
+                Some((existing, _)) if *existing == tag => {}
+                Some((_, first)) => anyhow::bail!(
+                    "tag {} is defined differently in {first} and {}",
+                    tag.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    spec.file
+                ),
+                None => tags.push((tag, spec.file)),
+            }
+        }
+    }
+    Ok(tags.into_iter().map(|(t, _)| t.clone()).collect())
+}
+
+/// All paths, prefixed with their spec's Base Path. Path items from several specs merge
+/// field by field. Operations inherit their spec's top-level `security`; unless all specs
+/// `share` the same server origins, path items carry their spec's origins as `servers`.
+fn merge_paths(specs: &[Spec], shared: bool) -> Result<Mapping> {
+    let mut paths = Mapping::new();
+    let mut owners: HashMap<(String, String), &str> = HashMap::new();
+    let mut templates: HashMap<String, (String, &str)> = HashMap::new();
+    for spec in specs {
+        let spec_paths = spec.doc.get("paths").and_then(Value::as_mapping);
+        for (path, item) in spec_paths.into_iter().flatten() {
+            let path = join_paths(&spec.base_path, path.as_str().unwrap_or_default());
+            let Value::Mapping(item) = item else { continue };
+            let mut item = item.clone();
+            if !shared && !spec.origins.is_empty() {
+                item.insert("servers".into(), Value::Sequence(spec.origins.clone()));
+            }
+            let (first_path, first) = templates
+                .entry(template_shape(&path))
+                .or_insert_with(|| (path.clone(), spec.file));
+            if *first_path != path {
+                anyhow::bail!(
+                    "{first_path} in {first} and {path} in {} differ only in template names",
+                    spec.file
+                );
+            }
+            let merged = paths
+                .entry(path.clone().into())
+                .or_insert_with(|| Mapping::new().into());
+            let merged = merged.as_mapping_mut().unwrap();
+            for (key, value) in &item {
+                if merged.contains_key(key) {
+                    if let Some(method) = key.as_str().filter(|k| METHODS.contains(k)) {
+                        let first = owners[&(path.clone(), method.to_string())];
+                        anyhow::bail!(
+                            "{path} {method} is defined in both {first} and {}",
+                            spec.file
+                        );
+                    }
+                    if merged[key] != *value {
+                        let field = key.as_str().unwrap_or_default();
+                        let first = owners[&(path.clone(), field.to_string())];
+                        anyhow::bail!(
+                            "{path} {field} is defined differently in {first} and {}",
+                            spec.file
+                        );
+                    }
+                    continue;
+                }
+                if let Some(field) = key.as_str() {
+                    owners.insert((path.clone(), field.to_string()), spec.file);
+                }
+                let mut value = value.clone();
+                if let (Some(security), Value::Mapping(op)) = (spec.doc.get("security"), &mut value)
+                    && METHODS.contains(&key.as_str().unwrap_or_default())
+                {
+                    op.entry("security".into())
+                        .or_insert_with(|| security.clone());
+                }
+                merged.insert(key.clone(), value);
+            }
+        }
+    }
+    Ok(paths)
 }
 
 /// A Source Spec's Base Path and its server origins (host part only).
