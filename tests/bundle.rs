@@ -235,3 +235,66 @@ fn identical_path_level_fields_merge() {
     )
     .unwrap();
 }
+
+fn spec_with_servers(servers: &str, path: &str, method: &str) -> String {
+    format!("openapi: 3.0.0\nservers:\n{servers}paths:\n  {path}:\n    {method}: {{}}\n")
+}
+
+#[test]
+fn shared_origins_become_top_level_servers() {
+    let a = spec_with_servers("  - url: https://h.example/a\n", "/x", "get");
+    let b = spec_with_servers("  - url: https://h.example/b\n", "/x", "get");
+    let out = bundle(&[src("a.swagger.yaml", &a), src("b.swagger.yaml", &b)], &info()).unwrap();
+    let v = parse(&out);
+    assert_eq!(v["servers"][0]["url"].as_str(), Some("https://h.example"));
+    assert_eq!(v["servers"].as_sequence().unwrap().len(), 1);
+    assert!(v["paths"]["/a/x"].get("servers").is_none());
+}
+
+#[test]
+fn differing_origins_become_per_path_servers() {
+    let a = spec_with_servers("  - url: https://one.example/a\n", "/x", "get");
+    let b = spec_with_servers("  - url: https://two.example/b\n", "/y", "get");
+    let out = bundle(&[src("a.swagger.yaml", &a), src("b.swagger.yaml", &b)], &info()).unwrap();
+    let v = parse(&out);
+    assert!(v.get("servers").is_none());
+    assert_eq!(v["paths"]["/a/x"]["servers"][0]["url"].as_str(), Some("https://one.example"));
+    assert_eq!(v["paths"]["/b/y"]["servers"][0]["url"].as_str(), Some("https://two.example"));
+}
+
+#[test]
+fn relative_server_urls_have_no_origin() {
+    let a = spec_with_servers("  - url: /a\n", "/x", "get");
+    let out = bundle(&[src("a.swagger.yaml", &a)], &info()).unwrap();
+    let v = parse(&out);
+    assert!(v.get("servers").is_none());
+    assert!(v["paths"]["/a/x"].get("servers").is_none());
+}
+
+#[test]
+fn path_variables_use_defaults_and_host_variables_are_kept() {
+    let a = "openapi: 3.0.0\nservers:\n  - url: https://{env}.example/{ver}\n    variables:\n      env:\n        default: prod\n      ver:\n        default: v2\npaths:\n  /x:\n    get: {}\n";
+    let out = bundle(&[src("a.swagger.yaml", a)], &info()).unwrap();
+    let v = parse(&out);
+    assert_eq!(paths_of(&out), ["/v2/x"]);
+    assert_eq!(v["servers"][0]["url"].as_str(), Some("https://{env}.example"));
+    assert_eq!(v["servers"][0]["variables"]["env"]["default"].as_str(), Some("prod"));
+    assert!(v["servers"][0]["variables"].get("ver").is_none());
+}
+
+#[test]
+fn servers_with_different_path_parts_fail_naming_file() {
+    let a = spec_with_servers("  - url: https://h.example/a\n  - url: https://i.example/b\n", "/x", "get");
+    let err = bundle(&[src("a.swagger.yaml", &a)], &info()).unwrap_err().to_string();
+    assert!(err.contains("a.swagger.yaml"), "{err}");
+}
+
+#[test]
+fn same_path_with_different_servers_fails_naming_files_and_path() {
+    let a = spec_with_servers("  - url: https://one.example\n", "/x", "get");
+    let b = spec_with_servers("  - url: https://two.example\n", "/x", "post");
+    let err = bundle(&[src("a.swagger.yaml", &a), src("b.swagger.yaml", &b)], &info()).unwrap_err().to_string();
+    for needle in ["a.swagger.yaml", "b.swagger.yaml", "/x"] {
+        assert!(err.contains(needle), "{err}");
+    }
+}

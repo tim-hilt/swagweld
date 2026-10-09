@@ -24,10 +24,20 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
     let mut components = Mapping::new();
     let mut owners: HashMap<(String, String), String> = HashMap::new();
     let mut templates: HashMap<String, (String, String)> = HashMap::new();
+    let mut specs = Vec::new();
     for source in sources {
         let spec: Value = serde_norway::from_str(&source.yaml)
             .with_context(|| format!("{}: invalid YAML", source.file))?;
         validate(source, &spec)?;
+        let (base, origins) = split_servers(&source.file, &spec)?;
+        specs.push((spec, base, origins));
+    }
+    let shared = specs.windows(2).all(|w| same_set(&w[0].2, &w[1].2));
+    let mut top_servers = Vec::new();
+    if shared {
+        top_servers = specs.first().map(|s| s.2.clone()).unwrap_or_default();
+    }
+    for (source, (spec, base, origins)) in sources.iter().zip(&specs) {
         if let Some(Value::Sequence(spec_tags)) = spec.get("tags") {
             for tag in spec_tags {
                 match tags.iter().find(|(t, _)| t.get("name") == tag.get("name")) {
@@ -55,11 +65,14 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
             }
         }
         if let Some(Value::Mapping(spec_paths)) = spec.get("paths") {
-            let base = base_path(&spec);
             for (path, item) in spec_paths {
                 let path = path.as_str().unwrap_or_default();
-                let path = join_paths(&base, path);
+                let path = join_paths(base, path);
                 let Value::Mapping(item) = item else { continue };
+                let mut item = item.clone();
+                if !shared && !origins.is_empty() {
+                    item.insert("servers".into(), Value::Sequence(origins.clone()));
+                }
                 let (first_path, first) = templates
                     .entry(template_shape(&path))
                     .or_insert_with(|| (path.clone(), source.file.clone()));
@@ -71,7 +84,7 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
                 }
                 let merged = paths.entry(path.clone().into()).or_insert_with(|| Mapping::new().into());
                 let merged = merged.as_mapping_mut().unwrap();
-                for (key, value) in item {
+                for (key, value) in &item {
                     if merged.contains_key(key) {
                         if let Some(method) = key.as_str().filter(|k| METHODS.contains(k)) {
                             let first = &owners[&(path.clone(), method.to_string())];
@@ -115,6 +128,9 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
     let mut root = Mapping::new();
     root.insert("openapi".into(), "3.0.0".into());
     root.insert("info".into(), Value::Mapping(info_map));
+    if !top_servers.is_empty() {
+        root.insert("servers".into(), Value::Sequence(top_servers));
+    }
     if !tags.is_empty() {
         root.insert("tags".into(), Value::Sequence(tags.into_iter().map(|(t, _)| t).collect()));
     }
@@ -125,13 +141,59 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
     Ok(serde_norway::to_string(&Value::Mapping(root))?)
 }
 
-/// The path part of the first `servers[].url`, or empty (`/`) if none.
-fn base_path(spec: &Value) -> String {
-    let url = spec["servers"][0]["url"].as_str().unwrap_or("/");
-    match url.split_once("://") {
-        Some((_, rest)) => rest.find('/').map_or("", |i| &rest[i..]).to_string(),
-        None => url.to_string(),
+/// A Source Spec's Base Path and its server origins (host part only).
+/// Relative URLs have no origin. All servers must agree on the path part.
+fn split_servers(file: &str, spec: &Value) -> Result<(String, Vec<Value>)> {
+    let mut base: Option<String> = None;
+    let mut origins: Vec<Value> = Vec::new();
+    let servers = spec.get("servers").and_then(Value::as_sequence).map(Vec::as_slice).unwrap_or_default();
+    for server in servers {
+        let url = server.get("url").and_then(Value::as_str).unwrap_or("/");
+        let (origin, path) = match url.split_once("://") {
+            Some((scheme, rest)) => {
+                let i = rest.find('/').unwrap_or(rest.len());
+                (Some(format!("{scheme}://{}", &rest[..i])), rest[i..].to_string())
+            }
+            None => (None, url.to_string()),
+        };
+        let mut path = path;
+        if let Some(Value::Mapping(vars)) = server.get("variables") {
+            for (name, var) in vars {
+                if let (Some(name), Some(default)) = (name.as_str(), var.get("default").and_then(Value::as_str)) {
+                    path = path.replace(&format!("{{{name}}}"), default);
+                }
+            }
+        }
+        let path = join_paths("", &path);
+        match &base {
+            Some(b) if *b != path => {
+                anyhow::bail!("{file}: servers declare different path parts ({b} and {path})")
+            }
+            _ => base = Some(path),
+        }
+        let Some(origin) = origin else { continue };
+        let mut entry = Mapping::new();
+        entry.insert("url".into(), origin.as_str().into());
+        if let Some(Value::Mapping(vars)) = server.get("variables") {
+            let used: Mapping = vars
+                .iter()
+                .filter(|(name, _)| origin.contains(&format!("{{{}}}", name.as_str().unwrap_or_default())))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if !used.is_empty() {
+                entry.insert("variables".into(), Value::Mapping(used));
+            }
+        }
+        let entry = Value::Mapping(entry);
+        if !origins.contains(&entry) {
+            origins.push(entry);
+        }
     }
+    Ok((base.unwrap_or_default(), origins))
+}
+
+fn same_set(a: &[Value], b: &[Value]) -> bool {
+    a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
 }
 
 /// The path with every `{param}` name erased, so `/a/{id}` and `/a/{x}` match.
