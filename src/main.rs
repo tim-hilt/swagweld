@@ -31,7 +31,10 @@ fn main() -> Result<()> {
     let output = cwd.join(&cli.output);
     for entry in ignore::WalkBuilder::new(&cwd).require_git(false).build() {
         let path = entry?.into_path();
-        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
         let is_spec = ["swagger.yaml", "swagger.yml"]
             .iter()
             .any(|s| name == *s || name.ends_with(&format!(".{s}")));
@@ -53,10 +56,15 @@ fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let title = cli
-        .title
-        .unwrap_or_else(|| cwd.file_name().map_or("".into(), |n| n.to_string_lossy().into()));
-    let info = Info { title, version: cli.api_version, description: cli.description };
+    let title = cli.title.unwrap_or_else(|| {
+        cwd.file_name()
+            .map_or("".into(), |n| n.to_string_lossy().into())
+    });
+    let info = Info {
+        title,
+        version: cli.api_version,
+        description: cli.description,
+    };
     let root_name = cwd.file_name().map_or("".into(), |n| n.to_string_lossy());
     let (out, warnings) = bundle_with_warnings(&sources, &info, &root_name)?;
     if !cli.quiet {

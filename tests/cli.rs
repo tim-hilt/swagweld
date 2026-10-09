@@ -37,7 +37,10 @@ const SPEC: &str = "openapi: 3.0.0\npaths:\n  /items:\n    get: {}\n";
 fn output_flag_writes_to_given_path_creating_parents() {
     let dir = tempdir().unwrap();
     write_spec(dir.path(), "a.swagger.yaml", SPEC);
-    swagweld(dir.path()).args(["-o", "out/nested/b.yaml"]).assert().success();
+    swagweld(dir.path())
+        .args(["-o", "out/nested/b.yaml"])
+        .assert()
+        .success();
     assert!(dir.path().join("out/nested/b.yaml").exists());
     assert!(!dir.path().join("dist").exists());
 }
@@ -64,8 +67,16 @@ fn error_writes_no_bundle() {
 #[test]
 fn title_is_directory_name_and_output_is_deterministic() {
     let dir = tempdir().unwrap();
-    write_spec(dir.path(), "z/z.swagger.yaml", "openapi: 3.0.0\npaths:\n  /z:\n    get: {}\n");
-    write_spec(dir.path(), "a/a.swagger.yaml", "openapi: 3.0.0\npaths:\n  /a:\n    get: {}\n");
+    write_spec(
+        dir.path(),
+        "z/z.swagger.yaml",
+        "openapi: 3.0.0\npaths:\n  /z:\n    get: {}\n",
+    );
+    write_spec(
+        dir.path(),
+        "a/a.swagger.yaml",
+        "openapi: 3.0.0\npaths:\n  /a:\n    get: {}\n",
+    );
     swagweld(dir.path()).assert().success();
     let first = fs::read_to_string(dir.path().join("dist/swagger.yaml")).unwrap();
     swagweld(dir.path()).assert().success();
@@ -133,7 +144,10 @@ fn output_path_is_never_a_source_spec() {
     write_spec(dir.path(), "a.swagger.yaml", &spec_at("kept"));
     // stale output from a previous run, with a matching name and a conflicting path
     write_spec(dir.path(), "out/bundle.swagger.yaml", &spec_at("kept"));
-    swagweld(dir.path()).args(["-o", "out/bundle.swagger.yaml"]).assert().success();
+    swagweld(dir.path())
+        .args(["-o", "out/bundle.swagger.yaml"])
+        .assert()
+        .success();
     let out = fs::read_to_string(dir.path().join("out/bundle.swagger.yaml")).unwrap();
     assert!(out.contains("/kept:"), "{out}");
 }
@@ -142,27 +156,51 @@ fn output_path_is_never_a_source_spec() {
 fn metadata_flags_and_defaults() {
     let dir = tempdir().unwrap();
     write_spec(dir.path(), "a.swagger.yaml", SPEC);
-    swagweld(dir.path()).args(["-t", "My API", "-v", "2.0.0", "-d", "Desc"]).assert().success();
+    swagweld(dir.path())
+        .args(["-t", "My API", "-v", "2.0.0", "-d", "Desc"])
+        .assert()
+        .success();
     let b = fs::read_to_string(dir.path().join("dist/swagger.yaml")).unwrap();
-    assert!(b.contains("title: My API") && b.contains("version: 2.0.0") && b.contains("description: Desc"), "{b}");
+    assert!(
+        b.contains("title: My API")
+            && b.contains("version: 2.0.0")
+            && b.contains("description: Desc"),
+        "{b}"
+    );
 
     let dir = tempdir().unwrap();
     write_spec(dir.path(), "a.swagger.yaml", SPEC);
     swagweld(dir.path()).assert().success();
     let b = fs::read_to_string(dir.path().join("dist/swagger.yaml")).unwrap();
-    let name = dir.path().file_name().unwrap().to_string_lossy().to_string();
-    assert!(b.contains(&format!("title: {name}")) && b.contains("version: 0.0.0") && !b.contains("description"), "{b}");
+    let name = dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        b.contains(&format!("title: {name}"))
+            && b.contains("version: 0.0.0")
+            && !b.contains("description"),
+        "{b}"
+    );
 }
 
 #[test]
 fn capital_v_prints_swagweld_version() {
     let dir = tempdir().unwrap();
-    swagweld(dir.path()).arg("-V").assert().success().stdout(predicates::str::contains(env!("CARGO_PKG_VERSION")));
+    swagweld(dir.path())
+        .arg("-V")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(env!("CARGO_PKG_VERSION")));
 }
 
 fn write_colliding(dir: &std::path::Path) {
     let spec = |path: &str, ty: &str| {
-        format!("openapi: 3.0.0\npaths:\n  {path}:\n    get: {{}}\ncomponents:\n  schemas:\n    User:\n      type: {ty}\n")
+        format!(
+            "openapi: 3.0.0\npaths:\n  {path}:\n    get: {{}}\ncomponents:\n  schemas:\n    User:\n      type: {ty}\n"
+        )
     };
     write_spec(dir, "a.swagger.yaml", &spec("/a", "string"));
     write_spec(dir, "b.swagger.yaml", &spec("/b", "integer"));
