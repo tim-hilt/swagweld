@@ -191,3 +191,47 @@ fn tag_with_different_content_fails_naming_both_files() {
     .to_string();
     assert!(e.contains("a.swagger.yaml") && e.contains("b.swagger.yaml") && e.contains('x'), "{e}");
 }
+
+#[test]
+fn paths_differing_only_in_template_names_collide() {
+    let err = bundle(
+        &[
+            src("a.swagger.yaml", "openapi: 3.0.0\npaths:\n  /users/{id}:\n    get: {}\n"),
+            src("b.swagger.yaml", "openapi: 3.0.0\npaths:\n  /users/{userId}:\n    post: {}\n"),
+        ],
+        &info(),
+    )
+    .unwrap_err()
+    .to_string();
+    for s in ["a.swagger.yaml", "b.swagger.yaml", "/users/{id}", "/users/{userId}"] {
+        assert!(err.contains(s), "{err}");
+    }
+}
+
+#[test]
+fn conflicting_path_level_field_fails() {
+    let err = bundle(
+        &[
+            src("a.swagger.yaml", "openapi: 3.0.0\npaths:\n  /items:\n    summary: one\n    get: {}\n"),
+            src("b.swagger.yaml", "openapi: 3.0.0\npaths:\n  /items:\n    summary: two\n    post: {}\n"),
+        ],
+        &info(),
+    )
+    .unwrap_err()
+    .to_string();
+    for s in ["a.swagger.yaml", "b.swagger.yaml", "/items", "summary"] {
+        assert!(err.contains(s), "{err}");
+    }
+}
+
+#[test]
+fn identical_path_level_fields_merge() {
+    bundle(
+        &[
+            src("a.swagger.yaml", "openapi: 3.0.0\npaths:\n  /items:\n    summary: same\n    get: {}\n"),
+            src("b.swagger.yaml", "openapi: 3.0.0\npaths:\n  /items:\n    summary: same\n    post: {}\n"),
+        ],
+        &info(),
+    )
+    .unwrap();
+}

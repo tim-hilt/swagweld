@@ -23,6 +23,7 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
     let mut tags: Vec<(Value, String)> = Vec::new();
     let mut components = Mapping::new();
     let mut owners: HashMap<(String, String), String> = HashMap::new();
+    let mut templates: HashMap<String, (String, String)> = HashMap::new();
     for source in sources {
         let spec: Value = serde_norway::from_str(&source.yaml)
             .with_context(|| format!("{}: invalid YAML", source.file))?;
@@ -59,6 +60,15 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
                 let path = path.as_str().unwrap_or_default();
                 let path = join_paths(&base, path);
                 let Value::Mapping(item) = item else { continue };
+                let (first_path, first) = templates
+                    .entry(template_shape(&path))
+                    .or_insert_with(|| (path.clone(), source.file.clone()));
+                if *first_path != path {
+                    anyhow::bail!(
+                        "{first_path} in {first} and {path} in {} differ only in template names",
+                        source.file
+                    );
+                }
                 let merged = paths.entry(path.clone().into()).or_insert_with(|| Mapping::new().into());
                 let merged = merged.as_mapping_mut().unwrap();
                 for (key, value) in item {
@@ -70,10 +80,18 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
                                 source.file
                             );
                         }
+                        if merged[key] != *value {
+                            let field = key.as_str().unwrap_or_default();
+                            let first = &owners[&(path.clone(), field.to_string())];
+                            anyhow::bail!(
+                                "{path} {field} is defined differently in {first} and {}",
+                                source.file
+                            );
+                        }
                         continue;
                     }
-                    if let Some(method) = key.as_str().filter(|k| METHODS.contains(k)) {
-                        owners.insert((path.clone(), method.to_string()), source.file.clone());
+                    if let Some(field) = key.as_str() {
+                        owners.insert((path.clone(), field.to_string()), source.file.clone());
                     }
                     let mut value = value.clone();
                     if let (Some(security), Value::Mapping(op)) = (spec.get("security"), &mut value) {
@@ -114,6 +132,24 @@ fn base_path(spec: &Value) -> String {
         Some((_, rest)) => rest.find('/').map_or("", |i| &rest[i..]).to_string(),
         None => url.to_string(),
     }
+}
+
+/// The path with every `{param}` name erased, so `/a/{id}` and `/a/{x}` match.
+fn template_shape(path: &str) -> String {
+    let mut out = String::new();
+    let mut in_param = false;
+    for c in path.chars() {
+        match c {
+            '{' => in_param = true,
+            '}' => {
+                in_param = false;
+                out.push_str("{}");
+            }
+            _ if !in_param => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Join with exactly one slash between segments.
