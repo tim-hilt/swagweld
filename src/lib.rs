@@ -41,6 +41,30 @@ pub fn bundle_with_warnings(sources: &[Source], info: &Info, root_name: &str) ->
         let (base, origins) = split_servers(&source.file, &spec)?;
         specs.push((spec, base, origins));
     }
+    let openapi = specs
+        .iter()
+        .filter_map(|(spec, ..)| spec["openapi"].as_str())
+        .max_by_key(|v| version_key(v))
+        .unwrap_or("3.0.0")
+        .to_string();
+    // Upgrade before Collision detection, so equivalent 3.0 and 3.1 schemas dedupe.
+    if !openapi.starts_with("3.0") {
+        for (spec, ..) in specs.iter_mut().filter(|(s, ..)| s["openapi"].as_str().is_some_and(|v| v.starts_with("3.0"))) {
+            upgrade_schemas(spec);
+        }
+    }
+    let mut dialect: Option<(&Value, &str)> = None;
+    for (source, (spec, ..)) in sources.iter().zip(&specs) {
+        match (spec.get("jsonSchemaDialect"), dialect) {
+            (Some(d), Some((first, file))) if d != first => anyhow::bail!(
+                "jsonSchemaDialect differs between {file} and {}",
+                source.file
+            ),
+            (Some(d), None) => dialect = Some((d, &source.file)),
+            _ => {}
+        }
+    }
+    let dialect = dialect.map(|(d, _)| d.clone());
     let mut warnings = rename_collisions(sources, &mut specs, root_name);
     warnings.extend(rename_webhooks(sources, &mut specs, root_name));
     warnings.extend(rename_operation_ids(sources, &mut specs, root_name)?);
@@ -157,8 +181,11 @@ pub fn bundle_with_warnings(sources: &[Source], info: &Info, root_name: &str) ->
     }
 
     let mut root = Mapping::new();
-    root.insert("openapi".into(), "3.0.0".into());
+    root.insert("openapi".into(), openapi.into());
     root.insert("info".into(), Value::Mapping(info_map));
+    if let Some(dialect) = dialect {
+        root.insert("jsonSchemaDialect".into(), dialect);
+    }
     if !top_servers.is_empty() {
         root.insert("servers".into(), Value::Sequence(top_servers));
     }
@@ -449,6 +476,52 @@ fn template_shape(path: &str) -> String {
 fn join_paths(base: &str, path: &str) -> String {
     let segments: Vec<&str> = base.split('/').chain(path.split('/')).filter(|s| !s.is_empty()).collect();
     format!("/{}", segments.join("/"))
+}
+
+/// Numeric version parts, so `3.0.10` orders above `3.0.3`.
+fn version_key(version: &str) -> Vec<u32> {
+    version.split('.').map(|part| part.parse().unwrap_or(0)).collect()
+}
+
+/// Rewrite OpenAPI 3.0 schema keywords into their 3.1 meaning, in place:
+/// `nullable: true` adds `"null"` to `type`, or wraps a type-less schema (e.g. a `$ref`)
+/// in `anyOf` with `{type: "null"}`; boolean `exclusiveMinimum/Maximum` absorb
+/// `minimum/maximum`. Example data, `enum`/`const` values and `x-` extensions are left
+/// untouched, since they may legitimately contain these keys as data.
+fn upgrade_schemas(node: &mut Value) {
+    match node {
+        Value::Mapping(map) => {
+            for (key, value) in map.iter_mut() {
+                let key = key.as_str().unwrap_or_default();
+                if !key.starts_with("x-") && !["example", "examples", "enum", "const"].contains(&key) {
+                    upgrade_schemas(value);
+                }
+            }
+            for (exclusive, bound) in [("exclusiveMinimum", "minimum"), ("exclusiveMaximum", "maximum")] {
+                let Some(&Value::Bool(on)) = map.get(exclusive) else { continue };
+                let bound = if on { map.shift_remove(bound) } else { None };
+                match bound {
+                    Some(bound) => map[exclusive] = bound,
+                    None => drop(map.shift_remove(exclusive)),
+                }
+            }
+            let Some(&Value::Bool(nullable)) = map.get("nullable") else { return };
+            map.shift_remove("nullable");
+            if !nullable {
+                return;
+            }
+            let null: Value = serde_norway::from_str("type: 'null'").unwrap();
+            match map.get("type").cloned() {
+                Some(t @ Value::String(_)) => map["type"] = Value::Sequence(vec![t, "null".into()]),
+                _ => {
+                    let schema = Value::Mapping(std::mem::take(map));
+                    map.insert("anyOf".into(), Value::Sequence(vec![schema, null]));
+                }
+            }
+        }
+        Value::Sequence(items) => items.iter_mut().for_each(upgrade_schemas),
+        _ => {}
+    }
 }
 
 /// Reject non-3.x specs and external `$ref`s.

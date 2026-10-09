@@ -446,3 +446,86 @@ fn differing_webhooks_are_renamed_with_spec_name_and_warn() {
     assert_eq!(warnings.len(), 2);
     assert!(warnings.iter().all(|w| w.contains("webhooks.ping")));
 }
+
+fn schema(file: &str, version: &str, user: &str) -> Source {
+    src(file, &format!("openapi: {version}\npaths:\n  /{file}:\n    get: {{}}\ncomponents:\n  schemas:\n    User:\n{user}"))
+}
+
+#[test]
+fn bundle_declares_highest_openapi_version() {
+    let (v, _) = weld(&[
+        src("a.swagger.yaml", "openapi: 3.0.3\npaths: {}\n"),
+        src("b.swagger.yaml", "openapi: 3.1.1\npaths: {}\n"),
+        src("c.swagger.yaml", "openapi: 3.0.10\npaths: {}\n"),
+    ]);
+    assert_eq!(v["openapi"], serde_norway::Value::from("3.1.1"));
+}
+
+#[test]
+fn all_3_0_sources_are_left_unconverted() {
+    let (v, _) = weld(&[schema("a.swagger.yaml", "3.0.3", "      type: string\n      nullable: true\n")]);
+    assert_eq!(v["openapi"], serde_norway::Value::from("3.0.3"));
+    assert_eq!(v["components"]["schemas"]["User"], parse("type: string\nnullable: true\n"));
+}
+
+#[test]
+fn nullable_type_becomes_null_type_when_bundle_is_3_1() {
+    let (v, _) = weld(&[
+        schema("a.swagger.yaml", "3.0.3", "      type: object\n      properties:\n        name:\n          type: string\n          nullable: true\n"),
+        src("b.swagger.yaml", "openapi: 3.1.0\npaths: {}\n"),
+    ]);
+    assert_eq!(v["components"]["schemas"]["User"]["properties"]["name"], parse("type: [string, 'null']\n"));
+}
+
+#[test]
+fn nullable_ref_becomes_any_of_with_null() {
+    let (v, _) = weld(&[
+        schema("a.swagger.yaml", "3.0.3", "      $ref: '#/components/schemas/Name'\n      nullable: true\n    Name:\n      type: string\n"),
+        src("b.swagger.yaml", "openapi: 3.2.0\npaths: {}\n"),
+    ]);
+    assert_eq!(
+        v["components"]["schemas"]["User"],
+        parse("anyOf:\n  - $ref: '#/components/schemas/Name'\n  - type: 'null'\n")
+    );
+}
+
+#[test]
+fn boolean_exclusive_bounds_become_numeric() {
+    let (v, _) = weld(&[
+        schema("a.swagger.yaml", "3.0.3", "      type: integer\n      minimum: 1\n      exclusiveMinimum: true\n      maximum: 9\n      exclusiveMaximum: false\n"),
+        src("b.swagger.yaml", "openapi: 3.1.0\npaths: {}\n"),
+    ]);
+    assert_eq!(v["components"]["schemas"]["User"], parse("type: integer\nexclusiveMinimum: 1\nmaximum: 9\n"));
+}
+
+#[test]
+fn equivalent_3_0_and_3_1_schemas_are_deduped() {
+    let (v, warnings) = weld(&[
+        schema("a.swagger.yaml", "3.0.3", "      type: string\n      nullable: true\n"),
+        schema("b.swagger.yaml", "3.1.0", "      type: [string, 'null']\n"),
+    ]);
+    assert_eq!(v["components"]["schemas"].as_mapping().unwrap().len(), 1);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn differing_json_schema_dialects_fail_naming_files() {
+    let err = bundle(
+        &[
+            src("a.swagger.yaml", "openapi: 3.1.0\njsonSchemaDialect: https://one\npaths: {}\n"),
+            src("b.swagger.yaml", "openapi: 3.1.0\njsonSchemaDialect: https://two\npaths: {}\n"),
+        ],
+        &info(),
+    )
+    .unwrap_err()
+    .to_string();
+    for needle in ["a.swagger.yaml", "b.swagger.yaml", "jsonSchemaDialect"] {
+        assert!(err.contains(needle), "{err}");
+    }
+}
+
+#[test]
+fn shared_json_schema_dialect_is_kept() {
+    let (v, _) = weld(&[src("a.swagger.yaml", "openapi: 3.1.0\njsonSchemaDialect: https://one\npaths: {}\n")]);
+    assert_eq!(v["jsonSchemaDialect"], serde_norway::Value::from("https://one"));
+}
