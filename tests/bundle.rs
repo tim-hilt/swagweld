@@ -1,7 +1,15 @@
-use swagweld::{Source, bundle};
+use swagweld::{Info, Source, bundle};
 
 fn src(file: &str, yaml: &str) -> Source {
     Source { file: file.into(), yaml: yaml.into() }
+}
+
+fn info() -> Info {
+    Info { title: "t".into(), version: "0.0.0".into(), description: None }
+}
+
+fn parse(yaml: &str) -> serde_norway::Value {
+    serde_norway::from_str(yaml).unwrap()
 }
 
 fn paths_of(yaml: &str) -> Vec<String> {
@@ -13,7 +21,7 @@ fn paths_of(yaml: &str) -> Vec<String> {
 fn relative_server_url_prefixes_paths() {
     let out = bundle(
         &[src("a.swagger.yaml", "openapi: 3.0.0\nservers:\n  - url: /users/v1\npaths:\n  /items:\n    get: {}\n")],
-        "t",
+        &info(),
     )
     .unwrap();
     assert_eq!(paths_of(&out), ["/users/v1/items"]);
@@ -23,7 +31,7 @@ fn relative_server_url_prefixes_paths() {
 fn absolute_server_url_yields_base_path() {
     let out = bundle(
         &[src("a.swagger.yaml", "openapi: 3.0.0\nservers:\n  - url: https://host.example/users/v1/\npaths:\n  /items:\n    get: {}\n")],
-        "t",
+        &info(),
     )
     .unwrap();
     assert_eq!(paths_of(&out), ["/users/v1/items"]);
@@ -33,7 +41,7 @@ fn absolute_server_url_yields_base_path() {
 fn root_base_path_leaves_paths_unchanged() {
     let out = bundle(
         &[src("a.swagger.yaml", "openapi: 3.0.0\nservers:\n  - url: /\npaths:\n  /items:\n    get: {}\n")],
-        "t",
+        &info(),
     )
     .unwrap();
     assert_eq!(paths_of(&out), ["/items"]);
@@ -46,7 +54,7 @@ fn disjoint_methods_on_same_path_are_merged() {
             src("a.swagger.yaml", "openapi: 3.0.0\npaths:\n  /items:\n    get: {}\n"),
             src("b.swagger.yaml", "openapi: 3.0.0\npaths:\n  /items:\n    post: {}\n"),
         ],
-        "t",
+        &info(),
     )
     .unwrap();
     let v: serde_norway::Value = serde_norway::from_str(&out).unwrap();
@@ -61,7 +69,7 @@ fn same_path_and_method_fails_naming_both_files() {
             src("a.swagger.yaml", "openapi: 3.0.0\npaths:\n  /items:\n    get: {}\n"),
             src("b.swagger.yaml", "openapi: 3.0.0\npaths:\n  /items:\n    get: {}\n"),
         ],
-        "t",
+        &info(),
     )
     .unwrap_err()
     .to_string();
@@ -71,7 +79,7 @@ fn same_path_and_method_fails_naming_both_files() {
 }
 
 fn err_of(yaml: &str) -> String {
-    bundle(&[src("bad.swagger.yaml", yaml)], "t").unwrap_err().to_string()
+    bundle(&[src("bad.swagger.yaml", yaml)], &info()).unwrap_err().to_string()
 }
 
 #[test]
@@ -110,10 +118,76 @@ fn internal_refs_components_and_extensions_are_kept() {
             "a.swagger.yaml",
             "openapi: 3.0.0\nx-top: 1\npaths:\n  /a:\n    x-ext: custom\n    get:\n      responses:\n        '200':\n          $ref: '#/components/responses/Ok'\ncomponents:\n  responses:\n    Ok:\n      description: ok\n",
         )],
-        "t",
+        &info(),
     )
     .unwrap();
     let v: serde_norway::Value = serde_norway::from_str(&out).unwrap();
     assert_eq!(v["components"]["responses"]["Ok"]["description"], "ok");
     assert_eq!(v["paths"]["/a"]["x-ext"], "custom");
+}
+
+#[test]
+fn info_comes_from_arguments_not_source_specs() {
+    let i = Info { title: "T".into(), version: "1.2.3".into(), description: Some("D".into()) };
+    let out = bundle(
+        &[src("a.swagger.yaml", "openapi: 3.0.0\ninfo:\n  title: Mine\n  version: '9'\nexternalDocs:\n  url: http://x\npaths: {}\n")],
+        &i,
+    )
+    .unwrap();
+    let v = parse(&out);
+    assert_eq!(v["info"]["title"], "T");
+    assert_eq!(v["info"]["version"], "1.2.3");
+    assert_eq!(v["info"]["description"], "D");
+    assert!(v.get("externalDocs").is_none());
+}
+
+#[test]
+fn no_description_when_omitted() {
+    let out = bundle(&[src("a.swagger.yaml", "openapi: 3.0.0\npaths: {}\n")], &info()).unwrap();
+    assert!(parse(&out)["info"].get("description").is_none());
+}
+
+#[test]
+fn top_level_security_is_pushed_down_to_operations_without_their_own() {
+    let out = bundle(
+        &[
+            src("a.swagger.yaml", "openapi: 3.0.0\nsecurity:\n  - key: []\npaths:\n  /a:\n    get: {}\n    post:\n      security: []\n"),
+            src("b.swagger.yaml", "openapi: 3.0.0\npaths:\n  /b:\n    get: {}\n"),
+        ],
+        &info(),
+    )
+    .unwrap();
+    let v = parse(&out);
+    assert!(v.get("security").is_none());
+    assert_eq!(v["paths"]["/a"]["get"]["security"][0]["key"].as_sequence().unwrap().len(), 0);
+    assert_eq!(v["paths"]["/a"]["post"]["security"].as_sequence().unwrap().len(), 0);
+    assert!(v["paths"]["/b"]["get"].get("security").is_none());
+}
+
+#[test]
+fn tags_are_combined_by_name_and_identical_duplicates_deduped() {
+    let out = bundle(
+        &[
+            src("a.swagger.yaml", "openapi: 3.0.0\ntags:\n  - name: x\n    description: d\npaths: {}\n"),
+            src("b.swagger.yaml", "openapi: 3.0.0\ntags:\n  - name: x\n    description: d\n  - name: y\npaths: {}\n"),
+        ],
+        &info(),
+    )
+    .unwrap();
+    let names: Vec<_> = parse(&out)["tags"].as_sequence().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names, ["x", "y"]);
+}
+
+#[test]
+fn tag_with_different_content_fails_naming_both_files() {
+    let e = bundle(
+        &[
+            src("a.swagger.yaml", "openapi: 3.0.0\ntags:\n  - name: x\n    description: one\npaths: {}\n"),
+            src("b.swagger.yaml", "openapi: 3.0.0\ntags:\n  - name: x\n    description: two\npaths: {}\n"),
+        ],
+        &info(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("a.swagger.yaml") && e.contains("b.swagger.yaml") && e.contains('x'), "{e}");
 }

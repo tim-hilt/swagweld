@@ -10,15 +10,36 @@ pub struct Source {
     pub yaml: String,
 }
 
+/// The Bundle's own `info` fields.
+pub struct Info {
+    pub title: String,
+    pub version: String,
+    pub description: Option<String>,
+}
+
 /// Weld Source Specs (already in sorted order) into Bundle YAML.
-pub fn bundle(sources: &[Source], title: &str) -> Result<String> {
+pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
     let mut paths = Mapping::new();
+    let mut tags: Vec<(Value, String)> = Vec::new();
     let mut components = Mapping::new();
     let mut owners: HashMap<(String, String), String> = HashMap::new();
     for source in sources {
         let spec: Value = serde_norway::from_str(&source.yaml)
             .with_context(|| format!("{}: invalid YAML", source.file))?;
         validate(source, &spec)?;
+        if let Some(Value::Sequence(spec_tags)) = spec.get("tags") {
+            for tag in spec_tags {
+                match tags.iter().find(|(t, _)| t.get("name") == tag.get("name")) {
+                    Some((existing, _)) if existing == tag => {}
+                    Some((_, first)) => anyhow::bail!(
+                        "tag {} is defined differently in {first} and {}",
+                        tag.get("name").and_then(Value::as_str).unwrap_or_default(),
+                        source.file
+                    ),
+                    None => tags.push((tag.clone(), source.file.clone())),
+                }
+            }
+        }
         if let Some(Value::Mapping(sections)) = spec.get("components") {
             for (section, entries) in sections {
                 let (Some(entries), Value::Mapping(into)) = (
@@ -54,19 +75,31 @@ pub fn bundle(sources: &[Source], title: &str) -> Result<String> {
                     if let Some(method) = key.as_str().filter(|k| METHODS.contains(k)) {
                         owners.insert((path.clone(), method.to_string()), source.file.clone());
                     }
-                    merged.insert(key.clone(), value.clone());
+                    let mut value = value.clone();
+                    if let (Some(security), Value::Mapping(op)) = (spec.get("security"), &mut value) {
+                        if METHODS.contains(&key.as_str().unwrap_or_default()) {
+                            op.entry("security".into()).or_insert_with(|| security.clone());
+                        }
+                    }
+                    merged.insert(key.clone(), value);
                 }
             }
         }
     }
 
-    let mut info = Mapping::new();
-    info.insert("title".into(), title.into());
-    info.insert("version".into(), "0.0.0".into());
+    let mut info_map = Mapping::new();
+    info_map.insert("title".into(), info.title.as_str().into());
+    info_map.insert("version".into(), info.version.as_str().into());
+    if let Some(d) = &info.description {
+        info_map.insert("description".into(), d.as_str().into());
+    }
 
     let mut root = Mapping::new();
     root.insert("openapi".into(), "3.0.0".into());
-    root.insert("info".into(), Value::Mapping(info));
+    root.insert("info".into(), Value::Mapping(info_map));
+    if !tags.is_empty() {
+        root.insert("tags".into(), Value::Sequence(tags.into_iter().map(|(t, _)| t).collect()));
+    }
     root.insert("paths".into(), Value::Mapping(paths));
     if !components.is_empty() {
         root.insert("components".into(), Value::Mapping(components));

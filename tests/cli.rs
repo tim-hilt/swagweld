@@ -137,3 +137,25 @@ fn output_path_is_never_a_source_spec() {
     let out = fs::read_to_string(dir.path().join("out/bundle.swagger.yaml")).unwrap();
     assert!(out.contains("/kept:"), "{out}");
 }
+
+#[test]
+fn metadata_flags_and_defaults() {
+    let dir = tempdir().unwrap();
+    write_spec(dir.path(), "a.swagger.yaml", SPEC);
+    swagweld(dir.path()).args(["-t", "My API", "-v", "2.0.0", "-d", "Desc"]).assert().success();
+    let b = fs::read_to_string(dir.path().join("dist/swagger.yaml")).unwrap();
+    assert!(b.contains("title: My API") && b.contains("version: 2.0.0") && b.contains("description: Desc"), "{b}");
+
+    let dir = tempdir().unwrap();
+    write_spec(dir.path(), "a.swagger.yaml", SPEC);
+    swagweld(dir.path()).assert().success();
+    let b = fs::read_to_string(dir.path().join("dist/swagger.yaml")).unwrap();
+    let name = dir.path().file_name().unwrap().to_string_lossy().to_string();
+    assert!(b.contains(&format!("title: {name}")) && b.contains("version: 0.0.0") && !b.contains("description"), "{b}");
+}
+
+#[test]
+fn capital_v_prints_swagweld_version() {
+    let dir = tempdir().unwrap();
+    swagweld(dir.path()).arg("-V").assert().success().stdout(predicates::str::contains(env!("CARGO_PKG_VERSION")));
+}

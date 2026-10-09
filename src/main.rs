@@ -1,13 +1,23 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
-use swagweld::{Source, bundle};
+use swagweld::{Info, Source, bundle};
 
 #[derive(Parser)]
+#[command(version)]
 struct Cli {
     /// Where to write the Bundle
     #[arg(short, long, default_value = "dist/swagger.yaml")]
     output: PathBuf,
+    /// Bundle info.title (default: current directory name)
+    #[arg(short, long)]
+    title: Option<String>,
+    /// Bundle info.version
+    #[arg(short = 'v', long, default_value = "0.0.0")]
+    api_version: String,
+    /// Bundle info.description
+    #[arg(short, long)]
+    description: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -40,8 +50,11 @@ fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let title = cwd.file_name().map_or("".into(), |n| n.to_string_lossy());
-    let out = bundle(&sources, &title)?;
+    let title = cli
+        .title
+        .unwrap_or_else(|| cwd.file_name().map_or("".into(), |n| n.to_string_lossy().into()));
+    let info = Info { title, version: cli.api_version, description: cli.description };
+    let out = bundle(&sources, &info)?;
     if let Some(parent) = cli.output.parent() {
         std::fs::create_dir_all(parent)?;
     }
