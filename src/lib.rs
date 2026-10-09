@@ -162,10 +162,10 @@ pub fn bundle_with_warnings(sources: &[Source], info: &Info, root_name: &str) ->
                         owners.insert((path.clone(), field.to_string()), source.file.clone());
                     }
                     let mut value = value.clone();
-                    if let (Some(security), Value::Mapping(op)) = (spec.get("security"), &mut value) {
-                        if METHODS.contains(&key.as_str().unwrap_or_default()) {
-                            op.entry("security".into()).or_insert_with(|| security.clone());
-                        }
+                    if let (Some(security), Value::Mapping(op)) = (spec.get("security"), &mut value)
+                        && METHODS.contains(&key.as_str().unwrap_or_default())
+                    {
+                        op.entry("security".into()).or_insert_with(|| security.clone());
                     }
                     merged.insert(key.clone(), value);
                 }
@@ -275,10 +275,10 @@ fn rename_webhooks(sources: &[Source], specs: &mut [(Value, String, Vec<Value>)]
                 files.join(", "),
                 sources[*i].file
             ));
-            if let Some(hooks) = specs[*i].0.get_mut("webhooks").and_then(Value::as_mapping_mut) {
-                if let Some(value) = hooks.remove(name.as_str()) {
-                    hooks.insert(new.as_str().into(), value);
-                }
+            if let Some(hooks) = specs[*i].0.get_mut("webhooks").and_then(Value::as_mapping_mut)
+                && let Some(value) = hooks.remove(name.as_str())
+            {
+                hooks.insert(new.as_str().into(), value);
             }
         }
     }
@@ -350,10 +350,10 @@ fn rewrite_links(node: &mut Value, old: &str, new: &str) {
             for (key, value) in map.iter_mut() {
                 if key.as_str() == Some("links") {
                     for link in value.as_mapping_mut().into_iter().flat_map(|l| l.values_mut()) {
-                        if let Some(Value::String(id)) = link.get_mut("operationId") {
-                            if id == old {
-                                *id = new.to_string();
-                            }
+                        if let Some(Value::String(id)) = link.get_mut("operationId")
+                            && id == old
+                        {
+                            *id = new.to_string();
                         }
                     }
                 }
@@ -541,10 +541,10 @@ fn check_refs(file: &str, node: &Value, pointer: &mut String) -> Result<()> {
     match node {
         Value::Mapping(map) => {
             for (key, value) in map {
-                if key.as_str() == Some("$ref") {
-                    if let Some(r) = value.as_str().filter(|r| !r.starts_with('#')) {
-                        anyhow::bail!("{file}: external $ref `{r}` at {pointer}");
-                    }
+                if key.as_str() == Some("$ref")
+                    && let Some(r) = value.as_str().filter(|r| !r.starts_with('#'))
+                {
+                    anyhow::bail!("{file}: external $ref `{r}` at {pointer}");
                 }
                 let key = match key {
                     Value::String(s) => s.clone(),
