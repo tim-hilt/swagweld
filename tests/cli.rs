@@ -76,3 +76,64 @@ fn title_is_directory_name_and_output_is_deterministic() {
     let name = dir.path().file_name().unwrap().to_str().unwrap();
     assert!(first.contains(&format!("title: {name}")), "{first}");
 }
+
+fn spec_at(path: &str) -> String {
+    format!("openapi: 3.0.0\npaths:\n  /{path}:\n    get: {{}}\n")
+}
+
+fn bundle_of(dir: &std::path::Path) -> String {
+    fs::read_to_string(dir.join("dist/swagger.yaml")).unwrap()
+}
+
+#[test]
+fn discovers_all_filename_patterns_and_ignores_other_yaml() {
+    let dir = tempdir().unwrap();
+    for (f, p) in [
+        ("swagger.yaml", "a"),
+        ("x/swagger.yml", "b"),
+        ("y/u.swagger.yaml", "c"),
+        ("z/v.swagger.yml", "d"),
+        ("other.yaml", "nope"),
+        ("w/openapi.yml", "nope2"),
+    ] {
+        write_spec(dir.path(), f, &spec_at(p));
+    }
+    swagweld(dir.path()).assert().success();
+    let out = bundle_of(dir.path());
+    for p in ["/a:", "/b:", "/c:", "/d:"] {
+        assert!(out.contains(p), "{out}");
+    }
+    assert!(!out.contains("/nope"), "{out}");
+}
+
+#[test]
+fn skips_gitignored_files() {
+    let dir = tempdir().unwrap();
+    write_spec(dir.path(), ".gitignore", "ignored/\n");
+    write_spec(dir.path(), "a.swagger.yaml", &spec_at("kept"));
+    write_spec(dir.path(), "ignored/b.swagger.yaml", &spec_at("dropped"));
+    swagweld(dir.path()).assert().success();
+    let out = bundle_of(dir.path());
+    assert!(out.contains("/kept:") && !out.contains("/dropped"), "{out}");
+}
+
+#[test]
+fn skips_hidden_directories() {
+    let dir = tempdir().unwrap();
+    write_spec(dir.path(), "a.swagger.yaml", &spec_at("kept"));
+    write_spec(dir.path(), ".hidden/b.swagger.yaml", &spec_at("dropped"));
+    swagweld(dir.path()).assert().success();
+    let out = bundle_of(dir.path());
+    assert!(out.contains("/kept:") && !out.contains("/dropped"), "{out}");
+}
+
+#[test]
+fn output_path_is_never_a_source_spec() {
+    let dir = tempdir().unwrap();
+    write_spec(dir.path(), "a.swagger.yaml", &spec_at("kept"));
+    // stale output from a previous run, with a matching name and a conflicting path
+    write_spec(dir.path(), "out/bundle.swagger.yaml", &spec_at("kept"));
+    swagweld(dir.path()).args(["-o", "out/bundle.swagger.yaml"]).assert().success();
+    let out = fs::read_to_string(dir.path().join("out/bundle.swagger.yaml")).unwrap();
+    assert!(out.contains("/kept:"), "{out}");
+}

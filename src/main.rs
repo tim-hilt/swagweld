@@ -15,9 +15,14 @@ fn main() -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     let mut files = Vec::new();
-    for entry in ignore::WalkBuilder::new(&cwd).build() {
+    let output = cwd.join(&cli.output);
+    for entry in ignore::WalkBuilder::new(&cwd).require_git(false).build() {
         let path = entry?.into_path();
-        if path.to_string_lossy().ends_with(".swagger.yaml") {
+        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let is_spec = ["swagger.yaml", "swagger.yml"]
+            .iter()
+            .any(|s| name == *s || name.ends_with(&format!(".{s}")));
+        if path.is_file() && is_spec && path != output {
             files.push(path.strip_prefix(&cwd)?.to_path_buf());
         }
     }
