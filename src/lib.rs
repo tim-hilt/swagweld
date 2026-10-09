@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use serde_norway::{Mapping, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+const SECTIONS: [&str; 8] =
+    ["schemas", "parameters", "responses", "requestBodies", "headers", "examples", "links", "callbacks"];
 const METHODS: [&str; 8] = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
 
 /// A discovered Source Spec: its relative path and raw YAML text.
@@ -19,10 +21,16 @@ pub struct Info {
 
 /// Weld Source Specs (already in sorted order) into Bundle YAML.
 pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
+    Ok(bundle_with_warnings(sources, info, "")?.0)
+}
+
+/// Like [`bundle`], also returning warnings. `root_name` is the Spec Name of root-level `swagger.yaml`.
+pub fn bundle_with_warnings(sources: &[Source], info: &Info, root_name: &str) -> Result<(String, Vec<String>)> {
     let mut paths = Mapping::new();
     let mut tags: Vec<(Value, String)> = Vec::new();
     let mut components = Mapping::new();
     let mut owners: HashMap<(String, String), String> = HashMap::new();
+    let mut component_owners: HashMap<(String, String), String> = HashMap::new();
     let mut templates: HashMap<String, (String, String)> = HashMap::new();
     let mut specs = Vec::new();
     for source in sources {
@@ -32,6 +40,7 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
         let (base, origins) = split_servers(&source.file, &spec)?;
         specs.push((spec, base, origins));
     }
+    let warnings = rename_collisions(sources, &mut specs, root_name);
     let shared = specs.windows(2).all(|w| same_set(&w[0].2, &w[1].2));
     let mut top_servers = Vec::new();
     if shared {
@@ -60,7 +69,18 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
                     continue;
                 };
                 for (name, value) in entries {
-                    into.entry(name.clone()).or_insert_with(|| value.clone());
+                    let key = (section.as_str().unwrap_or_default().to_string(), name.as_str().unwrap_or_default().to_string());
+                    if let Some(existing) = into.get(name) {
+                        if existing != value {
+                            anyhow::bail!(
+                                "components.{}.{} is defined differently in {} and {}",
+                                key.0, key.1, component_owners[&key], source.file
+                            );
+                        }
+                        continue;
+                    }
+                    component_owners.insert(key, source.file.clone());
+                    into.insert(name.clone(), value.clone());
                 }
             }
         }
@@ -138,7 +158,95 @@ pub fn bundle(sources: &[Source], info: &Info) -> Result<String> {
     if !components.is_empty() {
         root.insert("components".into(), Value::Mapping(components));
     }
-    Ok(serde_norway::to_string(&Value::Mapping(root))?)
+    Ok((serde_norway::to_string(&Value::Mapping(root))?, warnings))
+}
+
+/// The Spec Name: filename prefix of `<name>.swagger.yaml`, else the parent directory's name.
+fn spec_name(file: &str, root_name: &str) -> String {
+    let path = std::path::Path::new(file);
+    let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    for suffix in [".swagger.yaml", ".swagger.yml"] {
+        if let Some(prefix) = name.strip_suffix(suffix) {
+            return prefix.to_string();
+        }
+    }
+    match path.parent().and_then(|p| p.file_name()) {
+        Some(dir) => dir.to_string_lossy().into(),
+        None => root_name.to_string(),
+    }
+}
+
+/// Rename components that share a name but differ in content to `<SpecName>_<Name>`
+/// in every Source Spec defining them, rewriting local `$ref`s. Returns one warning per rename.
+fn rename_collisions(sources: &[Source], specs: &mut [(Value, String, Vec<Value>)], root_name: &str) -> Vec<String> {
+    let mut groups: BTreeMap<(&str, String), Vec<(usize, Value)>> = BTreeMap::new();
+    for (i, (spec, ..)) in specs.iter().enumerate() {
+        for section in SECTIONS {
+            let entries = spec.get("components").and_then(|c| c.get(section)).and_then(Value::as_mapping);
+            for (name, value) in entries.into_iter().flatten() {
+                if let Some(name) = name.as_str() {
+                    groups.entry((section, name.to_string())).or_default().push((i, value.clone()));
+                }
+            }
+        }
+    }
+    let mut renames: Vec<HashMap<(&str, String), String>> = vec![HashMap::new(); specs.len()];
+    let mut warnings = Vec::new();
+    for ((section, name), group) in &groups {
+        if group.iter().all(|(_, v)| *v == group[0].1) {
+            continue;
+        }
+        let files: Vec<&str> = group.iter().map(|(i, _)| sources[*i].file.as_str()).collect();
+        for (i, _) in group {
+            let new = format!("{}_{name}", spec_name(&sources[*i].file, root_name));
+            warnings.push(format!(
+                "components.{section}.{name} differs between {}; renamed to {new} in {}",
+                files.join(", "),
+                sources[*i].file
+            ));
+            renames[*i].insert((section, name.clone()), new);
+        }
+    }
+    for ((spec, ..), renames) in specs.iter_mut().zip(&renames) {
+        if !renames.is_empty() {
+            rewrite(spec, renames);
+        }
+    }
+    warnings
+}
+
+/// Apply renames to the component keys and to every local `$ref` of one spec.
+fn rewrite(spec: &mut Value, renames: &HashMap<(&str, String), String>) {
+    for ((section, old), new) in renames {
+        let entries = spec.get_mut("components").and_then(|c| c.get_mut(*section)).and_then(Value::as_mapping_mut);
+        if let Some(value) = entries.and_then(|e| e.remove(old.as_str()).map(|v| (e, v))) {
+            value.0.insert(new.as_str().into(), value.1);
+        }
+    }
+    rewrite_refs(spec, renames);
+}
+
+fn rewrite_refs(node: &mut Value, renames: &HashMap<(&str, String), String>) {
+    match node {
+        Value::Mapping(map) => {
+            for (key, value) in map.iter_mut() {
+                match (key.as_str(), &mut *value) {
+                    (Some("$ref"), Value::String(r)) => {
+                        let target = r.strip_prefix("#/components/").and_then(|t| t.split_once('/'));
+                        if let Some((section, rest)) = target {
+                            let (name, tail) = rest.split_once('/').map_or((rest, String::new()), |(n, t)| (n, format!("/{t}")));
+                            if let Some(new) = renames.iter().find(|((s, n), _)| *s == section && n == name).map(|(_, new)| new) {
+                                *r = format!("#/components/{section}/{new}{tail}");
+                            }
+                        }
+                    }
+                    _ => rewrite_refs(value, renames),
+                }
+            }
+        }
+        Value::Sequence(items) => items.iter_mut().for_each(|v| rewrite_refs(v, renames)),
+        _ => {}
+    }
 }
 
 /// A Source Spec's Base Path and its server origins (host part only).

@@ -159,3 +159,28 @@ fn capital_v_prints_swagweld_version() {
     let dir = tempdir().unwrap();
     swagweld(dir.path()).arg("-V").assert().success().stdout(predicates::str::contains(env!("CARGO_PKG_VERSION")));
 }
+
+fn write_colliding(dir: &std::path::Path) {
+    let spec = |path: &str, ty: &str| {
+        format!("openapi: 3.0.0\npaths:\n  {path}:\n    get: {{}}\ncomponents:\n  schemas:\n    User:\n      type: {ty}\n")
+    };
+    write_spec(dir, "a.swagger.yaml", &spec("/a", "string"));
+    write_spec(dir, "b.swagger.yaml", &spec("/b", "integer"));
+}
+
+#[test]
+fn collision_warnings_go_to_stderr() {
+    let dir = tempdir().unwrap();
+    write_colliding(dir.path());
+    swagweld(dir.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("a_User"));
+}
+
+#[test]
+fn quiet_silences_warnings() {
+    let dir = tempdir().unwrap();
+    write_colliding(dir.path());
+    swagweld(dir.path()).arg("-q").assert().success().stderr("");
+}

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
-use swagweld::{Info, Source, bundle};
+use swagweld::{Info, Source, bundle_with_warnings};
 
 #[derive(Parser)]
 #[command(version)]
@@ -18,6 +18,9 @@ struct Cli {
     /// Bundle info.description
     #[arg(short, long)]
     description: Option<String>,
+    /// Silence warnings
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 fn main() -> Result<()> {
@@ -54,7 +57,13 @@ fn main() -> Result<()> {
         .title
         .unwrap_or_else(|| cwd.file_name().map_or("".into(), |n| n.to_string_lossy().into()));
     let info = Info { title, version: cli.api_version, description: cli.description };
-    let out = bundle(&sources, &info)?;
+    let root_name = cwd.file_name().map_or("".into(), |n| n.to_string_lossy());
+    let (out, warnings) = bundle_with_warnings(&sources, &info, &root_name)?;
+    if !cli.quiet {
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
     if let Some(parent) = cli.output.parent() {
         std::fs::create_dir_all(parent)?;
     }

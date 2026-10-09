@@ -1,4 +1,4 @@
-use swagweld::{Info, Source, bundle};
+use swagweld::{Info, Source, bundle, bundle_with_warnings};
 
 fn src(file: &str, yaml: &str) -> Source {
     Source { file: file.into(), yaml: yaml.into() }
@@ -295,6 +295,70 @@ fn same_path_with_different_servers_fails_naming_files_and_path() {
     let b = spec_with_servers("  - url: https://two.example\n", "/x", "post");
     let err = bundle(&[src("a.swagger.yaml", &a), src("b.swagger.yaml", &b)], &info()).unwrap_err().to_string();
     for needle in ["a.swagger.yaml", "b.swagger.yaml", "/x"] {
+        assert!(err.contains(needle), "{err}");
+    }
+}
+
+const PATHS: &str = "paths:\n  /items:\n    get: {}\n";
+
+fn weld(sources: &[Source]) -> (serde_norway::Value, Vec<String>) {
+    let (yaml, warnings) = bundle_with_warnings(sources, &info(), "root").unwrap();
+    (parse(&yaml), warnings)
+}
+
+#[test]
+fn identical_components_are_deduped_silently() {
+    let yaml = format!("openapi: 3.0.0\n{PATHS}components:\n  schemas:\n    User:\n      type: string\n");
+    let (v, warnings) = weld(&[
+        src("a.swagger.yaml", &yaml),
+        src("b.swagger.yaml", &yaml.replace("/items", "/other")),
+    ]);
+    assert_eq!(v["components"]["schemas"].as_mapping().unwrap().len(), 1);
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn differing_components_are_renamed_in_every_source_and_warn() {
+    let a = format!("openapi: 3.0.0\n{PATHS}components:\n  schemas:\n    User:\n      type: string\n");
+    let b = "openapi: 3.0.0\npaths:\n  /other:\n    get: {}\ncomponents:\n  schemas:\n    User:\n      type: integer\n";
+    let (v, warnings) = weld(&[src("a.swagger.yaml", &a), src("users/b.swagger.yaml", b)]);
+    let schemas = &v["components"]["schemas"];
+    assert_eq!(schemas["a_User"]["type"], serde_norway::Value::from("string"));
+    assert_eq!(schemas["b_User"]["type"], serde_norway::Value::from("integer"));
+    assert!(schemas.get("User").is_none());
+    assert_eq!(warnings.len(), 2);
+    for needle in ["a.swagger.yaml", "users/b.swagger.yaml", "User", "a_User"] {
+        assert!(warnings.iter().any(|w| w.contains(needle)), "{needle}: {warnings:?}");
+    }
+}
+
+#[test]
+fn local_refs_in_renamed_source_are_rewritten() {
+    let a = "openapi: 3.0.0\npaths:\n  /items:\n    get:\n      responses:\n        '200':\n          content:\n            application/json:\n              schema:\n                $ref: '#/components/schemas/User'\ncomponents:\n  schemas:\n    User:\n      type: string\n";
+    let b = format!("openapi: 3.0.0\n{}components:\n  schemas:\n    User:\n      type: integer\n", PATHS.replace("/items", "/other"));
+    let (v, _) = weld(&[src("a.swagger.yaml", a), src("b.swagger.yaml", &b)]);
+    let schema = &v["paths"]["/items"]["get"]["responses"]["200"]["content"]["application/json"]["schema"];
+    assert_eq!(schema["$ref"], serde_norway::Value::from("#/components/schemas/a_User"));
+}
+
+#[test]
+fn renamed_name_that_still_collides_fails() {
+    let a = format!("openapi: 3.0.0\n{PATHS}components:\n  schemas:\n    User:\n      type: string\n");
+    let b = format!("openapi: 3.0.0\n{}components:\n  schemas:\n    User:\n      type: integer\n", PATHS.replace("/items", "/other"));
+    let err = bundle(&[src("x/a.swagger.yaml", &a), src("y/a.swagger.yaml", &b)], &info())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("a_User"), "{err}");
+}
+
+#[test]
+fn security_schemes_with_different_content_fail_instead_of_renaming() {
+    let a = format!("openapi: 3.0.0\n{PATHS}components:\n  securitySchemes:\n    auth:\n      type: http\n      scheme: basic\n");
+    let b = format!("openapi: 3.0.0\n{}components:\n  securitySchemes:\n    auth:\n      type: http\n      scheme: bearer\n", PATHS.replace("/items", "/other"));
+    let err = bundle(&[src("a.swagger.yaml", &a), src("b.swagger.yaml", &b)], &info())
+        .unwrap_err()
+        .to_string();
+    for needle in ["auth", "a.swagger.yaml", "b.swagger.yaml"] {
         assert!(err.contains(needle), "{err}");
     }
 }
